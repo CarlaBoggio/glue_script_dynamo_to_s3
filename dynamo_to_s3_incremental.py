@@ -30,19 +30,8 @@ required_params = [
     'catalog_table_name',         # Nombre de la tabla en el catálogo
 ]
 
-# Parámetros opcionales
-optional_params = [
-    's3_temp_bucket',             # Bucket temporal para exportación de DynamoDB
-    's3_temp_prefix',             # Prefijo temporal para exportación
-    'dynamo_region',              # Región de DynamoDB
-    's3_region'                   # Región de S3
-]
-
-# Combinamos todos los parámetros
-all_params = required_params + optional_params
-
-# Obtenemos los parámetros
-args = getResolvedOptions(sys.argv, all_params)
+# Obtenemos los parámetros requeridos
+args = getResolvedOptions(sys.argv, required_params)
 
 # Inicializar el contexto y job de Glue
 sc = SparkContext()
@@ -63,11 +52,22 @@ catalog_table_name = args['catalog_table_name']
 current_region = boto3.session.Session().region_name
 dynamo_account_id = get_aws_account_id()
 
-# Valores por defecto para parámetros opcionales - Asegurando regiones específicas
-dynamo_region = args.get('dynamo_region', "us-east-1")  # Virginia para DynamoDB
-s3_region = args.get('s3_region', "us-east-2")          # Ohio para S3
-s3_temp_bucket = args.get('s3_temp_bucket', f"aws-glue-assets-{dynamo_account_id}-{current_region}")
-s3_temp_prefix = args.get('s3_temp_prefix', "temporary/ddbexport/")
+# Definir parámetros opcionales con valores predeterminados
+# Ya no es necesario pasarlos como argumentos al job
+dynamo_region = "us-east-1"  # Virginia para DynamoDB
+s3_region = "us-east-2"      # Ohio para S3
+s3_temp_bucket = f"aws-glue-assets-{dynamo_account_id}-{current_region}"
+s3_temp_prefix = "temporary/ddbexport/"
+
+# Sobreescribir con valores de argumentos opcionales si se proporcionan
+if 'dynamo_region' in args:
+    dynamo_region = args['dynamo_region']
+if 's3_region' in args:
+    s3_region = args['s3_region']
+if 's3_temp_bucket' in args:
+    s3_temp_bucket = args['s3_temp_bucket']
+if 's3_temp_prefix' in args:
+    s3_temp_prefix = args['s3_temp_prefix']
 
 # Fecha y hora actual para nombrar la carpeta
 now = datetime.datetime.now()
