@@ -9,6 +9,7 @@ from awsglue.job import Job
 from awsglue.dynamicframe import DynamicFrame
 from awsgluedq.transforms import EvaluateDataQuality
 from pyspark.sql.functions import lit, current_date, current_timestamp, col, hash, struct
+from pyspark.sql.types import StringType, StructType, StructField, MapType
 
 # Función para obtener el ID de la cuenta AWS
 def get_aws_account_id():
@@ -54,7 +55,7 @@ dynamo_account_id = get_aws_account_id()
 
 # Definir parámetros opcionales con valores predeterminados
 # Ya no es necesario pasarlos como argumentos al job
-dynamo_region = "us-east-1"  # Virginia para DynamoDB
+dynamo_region = "us-east-2"  # Virginia para DynamoDB
 s3_region = "us-east-2"      # Ohio para S3
 s3_temp_bucket = f"aws-glue-assets-{dynamo_account_id}-{current_region}"
 s3_temp_prefix = "temporary/ddbexport/"
@@ -97,21 +98,74 @@ print(f"Usando clave primaria: {primary_key}")
 print(f"Ruta base en S3: {s3_target_path}")
 print(f"Ruta para nuevos registros: {s3_new_records_path}")
 
+
+def modulo_leer_datos_caracteres_especiales():
+        # Crear cliente DynamoDB
+    dynamo_client = boto3.resource('dynamodb', region_name=dynamo_region)
+    table = dynamo_client.Table(dynamo_table_name)
+    
+    # Escanear la tabla completa
+    response = table.scan()
+    items = response['Items']
+    
+    # Obtener todos los items en caso de paginación
+    while 'LastEvaluatedKey' in response:
+        response = table.scan(ExclusiveStartKey=response['LastEvaluatedKey'])
+        items.extend(response['Items'])
+    
+    # Procesar los items para convertir todo a strings y manejar caracteres especiales
+    processed_items = []
+    for item in items:
+        processed_item = {}
+        for key, value in item.items():
+            # Convertir todos los valores a strings para evitar problemas de tipo
+            if isinstance(value, dict) and value.get('S'):
+                # Si ya tiene formato DynamoDB, extraer el valor
+                processed_item[key] = str(value.get('S', ''))
+            elif isinstance(value, dict) and value.get('M'):
+                # Convertir mapas anidados a JSON string
+                processed_item[key] = str(value)
+            elif isinstance(value, bool):
+                # Convertir booleanos a strings explícitamente
+                processed_item[key] = str(value).lower()
+            else:
+                # Para cualquier otro valor, convertir a string
+                processed_item[key] = str(value)
+        processed_items.append(processed_item)
+    
+    # Crear un DataFrame con todos los campos como strings
+    if processed_items:
+        # Crear un schema donde todos los campos son StringType
+        sample_item = processed_items[0]
+        schema_fields = [StructField(key, StringType(), True) for key in sample_item.keys()]
+        schema = StructType(schema_fields)
+        
+        # Crear DataFrame con el schema explícito
+        items_df = spark.createDataFrame(processed_items, schema=schema)
+        # Convertir a DynamicFrame
+        return DynamicFrame.fromDF(items_df, glueContext, "dynamo_dyf")
+    
+
+
 try:
     # 1. Leer datos de DynamoDB en Virginia (us-east-1)
     print(f"Leyendo datos desde DynamoDB en región {dynamo_region} (Virginia)...")
-    dynamo_dyf = glueContext.create_dynamic_frame.from_options(
-        connection_type="dynamodb",
-        connection_options={
-            "dynamodb.export": "ddb",
-            "dynamodb.s3.bucket": s3_temp_bucket,
-            "dynamodb.s3.prefix": s3_temp_prefix,
-            "dynamodb.tableArn": dynamo_db_table_arn,
-            "dynamodb.unnestDDBJson": True,
-            "dynamodb.region": dynamo_region
-        },
-        transformation_ctx="dynamo_dyf"
-    )
+    try:
+        dynamo_dyf = glueContext.create_dynamic_frame.from_options(
+            connection_type="dynamodb",
+            connection_options={
+                "dynamodb.export": "ddb",
+                "dynamodb.s3.bucket": s3_temp_bucket,
+                "dynamodb.s3.prefix": s3_temp_prefix,
+                "dynamodb.tableArn": dynamo_db_table_arn,
+                "dynamodb.unnestDDBJson": True,
+                "dynamodb.region": dynamo_region
+            },
+            transformation_ctx="dynamo_dyf"
+        )
+    except Exception as s3_error:
+        # error por caracteres espediales
+        dynamo_dyf = modulo_leer_datos_caracteres_especiales()
 
     # Evaluar calidad de datos
     EvaluateDataQuality().process_rows(
