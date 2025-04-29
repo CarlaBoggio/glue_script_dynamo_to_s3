@@ -55,7 +55,7 @@ dynamo_account_id = get_aws_account_id()
 
 # Definir parámetros opcionales con valores predeterminados
 # Ya no es necesario pasarlos como argumentos al job
-dynamo_region = "us-east-2"  # Virginia para DynamoDB
+dynamo_region = "us-east-1"  # Virginia para DynamoDB
 s3_region = "us-east-2"      # Ohio para S3
 s3_temp_bucket = f"aws-glue-assets-{dynamo_account_id}-{current_region}"
 s3_temp_prefix = "temporary/ddbexport/"
@@ -98,61 +98,56 @@ print(f"Usando clave primaria: {primary_key}")
 print(f"Ruta base en S3: {s3_target_path}")
 print(f"Ruta para nuevos registros: {s3_new_records_path}")
 
-
 def modulo_leer_datos_dynamo():
     # Crear cliente DynamoDB
     dynamo_client = boto3.resource('dynamodb', region_name=dynamo_region)
     table = dynamo_client.Table(dynamo_table_name)
     
-    # Escanear la tabla completa
-    response = table.scan()
+    # Escanear la tabla completa usando cliente de bajo nivel para obtener datos en formato nativo
+    dynamodb = boto3.client('dynamodb', region_name=dynamo_region)
+    response = dynamodb.scan(TableName=dynamo_table_name)
     items = response['Items']
     
     # Obtener todos los items en caso de paginación
     while 'LastEvaluatedKey' in response:
-        response = table.scan(ExclusiveStartKey=response['LastEvaluatedKey'])
+        response = dynamodb.scan(
+            TableName=dynamo_table_name,
+            ExclusiveStartKey=response['LastEvaluatedKey']
+        )
         items.extend(response['Items'])
     
-    # Procesar los items para convertir todo a strings y manejar caracteres especiales
+    # Procesar los items para convertir todo a strings
     processed_items = []
     for item in items:
+        print("Item: ")
+        print(item);
         processed_item = {}
         for key, value in item.items():
-            # Convertir todos los valores a strings para evitar problemas de tipo
-            if isinstance(value, dict):
-                # Procesar tipos específicos de DynamoDB
-                if 'S' in value:  # String
-                    processed_item[key] = str(value['S'])
-                elif 'N' in value:  # Number
-                    processed_item[key] = str(value['N'])
-                elif 'BOOL' in value:  # Boolean
-                    processed_item[key] = str(value['BOOL']).lower()
-                elif 'L' in value:  # List
-                    processed_item[key] = str(value['L'])
-                elif 'M' in value:  # Map
-                    processed_item[key] = str(value['M'])
-                elif 'NULL' in value:  # Null
-                    processed_item[key] = "null"
-                elif 'B' in value:  # Binary
-                    processed_item[key] = "[binary data]"
-                elif 'SS' in value:  # String Set
-                    processed_item[key] = str(value['SS'])
-                elif 'NS' in value:  # Number Set
-                    processed_item[key] = str(value['NS'])
-                elif 'BS' in value:  # Binary Set
-                    processed_item[key] = "[binary set data]"
-                else:
-                    # Para otros tipos de diccionario, convertir a string JSON
-                    processed_item[key] = str(value)
-            elif isinstance(value, bool):
-                # Convertir booleanos a strings explícitamente
-                processed_item[key] = str(value).lower()
-            elif value is None:
-                # Manejar valores nulos
+            # Procesar según el tipo de dato en DynamoDB
+            if 'S' in value:  # String
+                processed_item[key] = value['S']
+            elif 'N' in value:  # Number
+                processed_item[key] = value['N']
+            elif 'BOOL' in value:  # Boolean
+                processed_item[key] = str(value['BOOL']).lower()
+            elif 'L' in value:  # List
+                processed_item[key] = str(value['L'])
+            elif 'M' in value:  # Map
+                processed_item[key] = str(value['M'])
+            elif 'NULL' in value:  # Null
                 processed_item[key] = "null"
+            elif 'B' in value:  # Binary
+                processed_item[key] = "[binary data]"
+            elif 'SS' in value:  # String Set
+                processed_item[key] = str(value['SS'])
+            elif 'NS' in value:  # Number Set
+                processed_item[key] = str(value['NS'])
+            elif 'BS' in value:  # Binary Set
+                processed_item[key] = "[binary set data]"
             else:
-                # Para cualquier otro valor, convertir a string
+                # Para cualquier otro formato no reconocido
                 processed_item[key] = str(value)
+        
         processed_items.append(processed_item)
     
     # Crear un DataFrame con todos los campos como strings
@@ -168,27 +163,11 @@ def modulo_leer_datos_dynamo():
         return DynamicFrame.fromDF(items_df, glueContext, "dynamo_dyf")
     else: 
         raise Exception("There is no items in table to process")
-
-
 try:
     # 1. Leer datos de DynamoDB en Virginia (us-east-1)
     print(f"Leyendo datos desde DynamoDB en región {dynamo_region} (Virginia)...")
-    try:
-        dynamo_dyf = glueContext.create_dynamic_frame.from_options(
-            connection_type="dynamodb",
-            connection_options={
-                "dynamodb.export": "ddb",
-                "dynamodb.s3.bucket": s3_temp_bucket,
-                "dynamodb.s3.prefix": s3_temp_prefix,
-                "dynamodb.tableArn": dynamo_db_table_arn,
-                "dynamodb.unnestDDBJson": True,
-                "dynamodb.region": dynamo_region
-            },
-            transformation_ctx="dynamo_dyf"
-        )
-    except Exception as s3_error:
-        # error por caracteres espediales
-        dynamo_dyf = modulo_leer_datos_caracteres_especiales()
+
+    dynamo_dyf = modulo_leer_datos_dynamo()
 
     # Evaluar calidad de datos
     EvaluateDataQuality().process_rows(
