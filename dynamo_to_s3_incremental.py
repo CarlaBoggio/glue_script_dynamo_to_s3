@@ -99,70 +99,105 @@ print(f"Ruta base en S3: {s3_target_path}")
 print(f"Ruta para nuevos registros: {s3_new_records_path}")
 
 def modulo_leer_datos_dynamo():
-    # Crear cliente DynamoDB
-    dynamo_client = boto3.resource('dynamodb', region_name=dynamo_region)
-    table = dynamo_client.Table(dynamo_table_name)
+    """
+    Lee datos de una tabla DynamoDB y los convierte a un formato adecuado para Spark.
+    Maneja todos los tipos de datos nativos de DynamoDB y asegura que todos los campos
+    se procesen correctamente.
+    """
+    print(f"Conectando a DynamoDB en región {dynamo_region}...")
     
-    # Escanear la tabla completa usando cliente de bajo nivel para obtener datos en formato nativo
-    dynamodb = boto3.client('dynamodb', region_name=dynamo_region)
-    response = dynamodb.scan(TableName=dynamo_table_name)
-    items = response['Items']
-    
-    # Obtener todos los items en caso de paginación
-    while 'LastEvaluatedKey' in response:
-        response = dynamodb.scan(
-            TableName=dynamo_table_name,
-            ExclusiveStartKey=response['LastEvaluatedKey']
-        )
-        items.extend(response['Items'])
-    
-    # Procesar los items para convertir todo a strings
-    processed_items = []
-    for item in items:
-        print("Item: ")
-        print(item);
-        processed_item = {}
-        for key, value in item.items():
-            # Procesar según el tipo de dato en DynamoDB
-            if 'S' in value:  # String
-                processed_item[key] = value['S']
-            elif 'N' in value:  # Number
-                processed_item[key] = value['N']
-            elif 'BOOL' in value:  # Boolean
-                processed_item[key] = str(value['BOOL']).lower()
-            elif 'L' in value:  # List
-                processed_item[key] = str(value['L'])
-            elif 'M' in value:  # Map
-                processed_item[key] = str(value['M'])
-            elif 'NULL' in value:  # Null
-                processed_item[key] = "null"
-            elif 'B' in value:  # Binary
-                processed_item[key] = "[binary data]"
-            elif 'SS' in value:  # String Set
-                processed_item[key] = str(value['SS'])
-            elif 'NS' in value:  # Number Set
-                processed_item[key] = str(value['NS'])
-            elif 'BS' in value:  # Binary Set
-                processed_item[key] = "[binary set data]"
-            else:
-                # Para cualquier otro formato no reconocido
-                processed_item[key] = str(value)
+    try:
+        # Usar cliente de bajo nivel para obtener datos en formato nativo de DynamoDB
+        dynamodb = boto3.client('dynamodb', region_name=dynamo_region)
         
-        processed_items.append(processed_item)
-    
-    # Crear un DataFrame con todos los campos como strings
-    if processed_items:
-        # Crear un schema donde todos los campos son StringType
-        sample_item = processed_items[0]
-        schema_fields = [StructField(key, StringType(), True) for key in sample_item.keys()]
-        schema = StructType(schema_fields)
+        print(f"Escaneando tabla {dynamo_table_name}...")
+        response = dynamodb.scan(TableName=dynamo_table_name)
+        items = response['Items']
         
-        # Crear DataFrame con el schema explícito
-        items_df = spark.createDataFrame(processed_items, schema=schema)
-        # Convertir a DynamicFrame
-        return DynamicFrame.fromDF(items_df, glueContext, "dynamo_dyf")
-    else: 
-        raise Exception("There is no items in table to process")
+        # Obtener todos los items en caso de paginación
+        while 'LastEvaluatedKey' in response:
+            print(f"Recuperando más registros (paginación)...")
+            response = dynamodb.scan(
+                TableName=dynamo_table_name,
+                ExclusiveStartKey=response['LastEvaluatedKey']
+            )
+            items.extend(response['Items'])
+        
+        # Mostrar información de diagnóstico
+        print(f"Total de registros recuperados: {len(items)}")
+        if items:
+            print(f"Ejemplo del primer item (primeros 3 campos):")
+            sample_item = items[0]
+            sample_keys = list(sample_item.keys())[:3]
+            for key in sample_keys:
+                print(f"  {key}: {sample_item[key]}")
+        
+        # Procesar los items para convertir todo a strings
+        processed_items = []
+        for item in items:
+            processed_item = {}
+            for key, value in item.items():
+                if 'S' in value:  # String
+                    processed_item[key] = value['S']
+                elif 'N' in value:  # Number
+                    processed_item[key] = value['N']
+                elif 'BOOL' in value:  # Boolean
+                    # Convertir a 'true' o 'false' (minúsculas) para consistencia
+                    processed_item[key] = str(value['BOOL']).lower()
+                elif 'L' in value:  # List
+                    processed_item[key] = str(value['L'])
+                elif 'M' in value:  # Map
+                    processed_item[key] = str(value['M'])
+                elif 'NULL' in value:  # Null
+                    processed_item[key] = "null"
+                elif 'B' in value:  # Binary
+                    processed_item[key] = "[binary data]"
+                elif 'SS' in value:  # String Set
+                    processed_item[key] = str(value['SS'])
+                elif 'NS' in value:  # Number Set
+                    processed_item[key] = str(value['NS'])
+                elif 'BS' in value:  # Binary Set
+                    processed_item[key] = "[binary set data]"
+                else:
+                    # Para cualquier otro formato no reconocido
+                    processed_item[key] = str(value)
+            
+            processed_items.append(processed_item)
+        
+        # Determinar un schema común basado en todos los campos encontrados
+        all_fields = set()
+        for item in processed_items:
+            all_fields.update(item.keys())
+        
+        print(f"Campos encontrados en la tabla: {', '.join(sorted(all_fields))}")
+        
+        # Asegurarse de que cada item tenga todos los campos (con valores nulos si es necesario)
+        for item in processed_items:
+            for field in all_fields:
+                if field not in item:
+                    item[field] = None
+        
+        # Crear un DataFrame con todos los campos como StringType
+        if processed_items:
+            schema_fields = [StructField(key, StringType(), True) for key in all_fields]
+            schema = StructType(schema_fields)
+            
+            print(f"Creando DataFrame con {len(schema_fields)} columnas...")
+            items_df = spark.createDataFrame(processed_items, schema=schema)
+            
+            # Convertir a DynamicFrame y retornar
+            return DynamicFrame.fromDF(items_df, glueContext, "dynamo_dyf")
+        else: 
+            raise Exception("No hay elementos en la tabla para procesar")
+    
+    except Exception as e:
+        print(f"Error al leer datos de DynamoDB: {str(e)}")
+        print(f"Tipo de error: {type(e).__name__}")
+        import traceback
+        traceback.print_exc()
+        raise Exception(f"Error al procesar DynamoDB: {str(e)}")
+        
+        
 try:
     # 1. Leer datos de DynamoDB en Virginia (us-east-1)
     print(f"Leyendo datos desde DynamoDB en región {dynamo_region} (Virginia)...")
