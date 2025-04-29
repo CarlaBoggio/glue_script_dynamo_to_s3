@@ -99,8 +99,8 @@ print(f"Ruta base en S3: {s3_target_path}")
 print(f"Ruta para nuevos registros: {s3_new_records_path}")
 
 
-def modulo_leer_datos_caracteres_especiales():
-        # Crear cliente DynamoDB
+def modulo_leer_datos_dynamo():
+    # Crear cliente DynamoDB
     dynamo_client = boto3.resource('dynamodb', region_name=dynamo_region)
     table = dynamo_client.Table(dynamo_table_name)
     
@@ -119,15 +119,37 @@ def modulo_leer_datos_caracteres_especiales():
         processed_item = {}
         for key, value in item.items():
             # Convertir todos los valores a strings para evitar problemas de tipo
-            if isinstance(value, dict) and value.get('S'):
-                # Si ya tiene formato DynamoDB, extraer el valor
-                processed_item[key] = str(value.get('S', ''))
-            elif isinstance(value, dict) and value.get('M'):
-                # Convertir mapas anidados a JSON string
-                processed_item[key] = str(value)
+            if isinstance(value, dict):
+                # Procesar tipos específicos de DynamoDB
+                if 'S' in value:  # String
+                    processed_item[key] = str(value['S'])
+                elif 'N' in value:  # Number
+                    processed_item[key] = str(value['N'])
+                elif 'BOOL' in value:  # Boolean
+                    processed_item[key] = str(value['BOOL']).lower()
+                elif 'L' in value:  # List
+                    processed_item[key] = str(value['L'])
+                elif 'M' in value:  # Map
+                    processed_item[key] = str(value['M'])
+                elif 'NULL' in value:  # Null
+                    processed_item[key] = "null"
+                elif 'B' in value:  # Binary
+                    processed_item[key] = "[binary data]"
+                elif 'SS' in value:  # String Set
+                    processed_item[key] = str(value['SS'])
+                elif 'NS' in value:  # Number Set
+                    processed_item[key] = str(value['NS'])
+                elif 'BS' in value:  # Binary Set
+                    processed_item[key] = "[binary set data]"
+                else:
+                    # Para otros tipos de diccionario, convertir a string JSON
+                    processed_item[key] = str(value)
             elif isinstance(value, bool):
                 # Convertir booleanos a strings explícitamente
                 processed_item[key] = str(value).lower()
+            elif value is None:
+                # Manejar valores nulos
+                processed_item[key] = "null"
             else:
                 # Para cualquier otro valor, convertir a string
                 processed_item[key] = str(value)
@@ -144,7 +166,8 @@ def modulo_leer_datos_caracteres_especiales():
         items_df = spark.createDataFrame(processed_items, schema=schema)
         # Convertir a DynamicFrame
         return DynamicFrame.fromDF(items_df, glueContext, "dynamo_dyf")
-    
+    else: 
+        raise Exception("There is no items in table to process")
 
 
 try:
