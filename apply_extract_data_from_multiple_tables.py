@@ -14,12 +14,15 @@ glue_client = boto3.client('glue')
 # Nombre del trabajo de Glue
 job_name = 'generic_extract_table_information_from_dynamo_to_s3'
 
+database = 'general'
+bucket = 'mf-gluesparkscripts'
+
 # Lista de configuraciones (cada elemento es un conjunto de parámetros para una ejecución)
 job_configs = [
     #1. bd_users_table - users
     {
-        '--bucket_name': 'mf-gluesparkscripts',
-        '--catalog_database': 'general',
+        '--bucket_name': bucket,
+        '--catalog_database': database,
         '--catalog_table_name': 'users',
         '--dynamo_table_name': 'ERC_USERS_TABLE',
         '--folder_name': 'users',
@@ -28,8 +31,8 @@ job_configs = [
     
     # 2. bd-contracts - contracts
     {
-        '--bucket_name': 'mf-gluesparkscripts',
-        '--catalog_database': 'general',
+        '--bucket_name': bucket,
+        '--catalog_database': database,
         '--catalog_table_name': 'contracts',
         '--dynamo_table_name': 'ERC_Contracts',
         '--folder_name': 'contracts',
@@ -38,8 +41,8 @@ job_configs = [
     
     #3. erc_utilidades - erc_utilidades
     {
-        '--bucket_name': 'mf-gluesparkscripts',
-        '--catalog_database': 'general',
+        '--bucket_name': bucket,
+        '--catalog_database': database,
         '--catalog_table_name': 'erc_utilidades',
         '--dynamo_table_name': 'ERC_utilidades',
         '--folder_name': 'ERC_Utilidades',
@@ -48,16 +51,16 @@ job_configs = [
     
     # 4. user_transactions_target - user_transaction
     {
-        '--bucket_name': 'mf-gluesparkscripts',
-        '--catalog_database': 'general',
+        '--bucket_name': bucket,
+        '--catalog_database': database,
         '--catalog_table_name': 'user_transaction',
         '--dynamo_table_name': 'users_transactions',
         '--folder_name': 'user-transactions',
         '--primary_key': 'id'
     },
     {
-        '--bucket_name': 'mf-gluesparkscripts',
-        '--catalog_database': 'general',
+        '--bucket_name': bucket,
+        '--catalog_database': database,
         '--catalog_table_name': 'ERC_COUNTRY_CONTRACTS',
         '--dynamo_table_name': 'ERC_COUNTRY_CONTRACTS',
         '--folder_name': 'ERC_COUNTRY_CONTRACTS',
@@ -65,8 +68,8 @@ job_configs = [
     },
         # 5.  ERC Balances
     {
-        '--bucket_name': 'mf-gluesparkscripts',
-        '--catalog_database': 'general',
+        '--bucket_name': bucket,
+        '--catalog_database': database,
         '--catalog_table_name': 'erc_balances_table',
         '--dynamo_table_name': 'ERC_Balances',
         '--folder_name': 'ERC_Balances',
