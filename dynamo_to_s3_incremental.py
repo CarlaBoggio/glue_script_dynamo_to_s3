@@ -10,7 +10,7 @@ from awsglue.dynamicframe import DynamicFrame
 from awsgluedq.transforms import EvaluateDataQuality
 from pyspark.sql.functions import lit, current_date, current_timestamp, col, hash, struct
 from pyspark.sql.types import StringType, StructType, StructField, MapType
-
+import pyarrow
 # Función para obtener el ID de la cuenta AWS
 def get_aws_account_id():
     sts_client = boto3.client('sts')
@@ -97,6 +97,105 @@ print(f"Región donde se ejecuta Glue: {current_region}")
 print(f"Usando clave primaria: {primary_key}")
 print(f"Ruta base en S3: {s3_target_path}")
 print(f"Ruta para nuevos registros: {s3_new_records_path}")
+
+def write_by_pk_to_s3(dynamic_frame, primary_key, target_path):
+    """
+    Escribe cada fila del DynamicFrame como un archivo Parquet individual en S3.
+    El nombre de cada archivo será el valor de la clave primaria.
+    
+    Args:
+        dynamic_frame: DynamicFrame de Glue con los datos a escribir
+        primary_key: Nombre de la columna que contiene la clave primaria
+        target_path: Ruta en S3 donde se escribirán los archivos
+        s3_region: Región de S3 donde se encuentra el bucket
+    """
+    import uuid
+    from pyspark.sql.functions import col
+    import boto3
+    from io import BytesIO
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    
+    print(f"Escribiendo registros individuales por clave primaria '{primary_key}' en {target_path}...")
+    
+    # Crear cliente S3 con la región específica
+    s3_client = boto3.client('s3', region_name=s3_region)
+    
+    # Convertir a DataFrame para procesar
+    df = dynamic_frame.toDF()
+    
+    # Obtener la cantidad total de filas
+    total_rows = df.count()
+    print(f"Total de registros a procesar por PK: {total_rows}")
+    
+    # Obtener todos los valores de clave primaria únicos
+    pk_values = [row[primary_key] for row in df.select(primary_key).distinct().collect()]
+    print(f"Número de valores de clave primaria únicos: {len(pk_values)}")
+    
+    success_count = 0
+    error_count = 0
+    
+    # Procesar cada registro por su clave primaria
+    for pk_value in pk_values:
+        try:
+            if pk_value is None or pk_value == "":
+                # Generar un UUID si la clave primaria es nula o vacía
+                clean_pk = f"unknown_pk_{uuid.uuid4().hex}"
+            else:
+                # Limpiar el valor de la clave primaria para usarlo como nombre de archivo
+                clean_pk = str(pk_value).replace("/", "_").replace("\\", "_").replace(":", "_")
+                clean_pk = clean_pk.replace("*", "_").replace("?", "_").replace("\"", "_")
+                clean_pk = clean_pk.replace("<", "_").replace(">", "_").replace("|", "_")
+                clean_pk = clean_pk.replace(" ", "_")
+            
+            # Filtrar solo la fila con esa clave primaria
+            single_row_df = df.filter(col(primary_key) == pk_value)
+            
+            # Si encontramos la fila, escribirla con el nombre de la clave primaria
+            if single_row_df.count() > 0:
+                # Convertir a PyArrow Table y luego a Parquet
+                pandas_df = single_row_df.toPandas()
+                table = pa.Table.from_pandas(pandas_df)
+                
+                # Escribir a un buffer de memoria
+                buf = BytesIO()
+                pq.write_table(table, buf)
+                buf.seek(0)
+                
+                # Extraer bucket y key del path
+                target_path = target_path.replace("s3://", "")
+                parts = target_path.split("/", 1)
+                bucket = parts[0]
+                
+                # Construir la clave S3 completa
+                if len(parts) > 1:
+                    folder_prefix = parts[1]
+                    s3_key = f"{folder_prefix}{clean_pk}.parquet"
+                else:
+                    s3_key = f"{clean_pk}.parquet"
+                
+                # Subir el archivo directamente a S3 (no como carpeta)
+                s3_client.put_object(
+                    Bucket=bucket, 
+                    Key=s3_key, 
+                    Body=buf.getvalue()
+                )
+                
+                success_count += 1
+                if success_count % 20 == 0:
+                    print(f"Progreso: {success_count}/{len(pk_values)} registros procesados")
+            else:
+                print(f"Advertencia: No se encontró la fila con PK '{pk_value}'")
+                
+        except Exception as e:
+            error_count += 1
+            print(f"Error al procesar registro con PK '{pk_value}': {str(e)}")
+            import traceback
+            traceback.print_exc()
+    
+    print(f"Proceso completado: {success_count} registros escritos como archivos individuales, {error_count} errores")
+    return success_count
+
 
 def modulo_leer_datos_dynamo():
     """
@@ -198,13 +297,9 @@ def modulo_leer_datos_dynamo():
         raise Exception(f"Error al procesar DynamoDB: {str(e)}")
         
         
-try:
-    # 1. Leer datos de DynamoDB en Virginia (us-east-1)
-    print(f"Leyendo datos desde DynamoDB en región {dynamo_region} (Virginia)...")
-
-    dynamo_dyf = modulo_leer_datos_dynamo()
-
-    # Evaluar calidad de datos
+        
+def evaluarCalidadDatos(dynamo_dyf):
+        # Evaluar calidad de datos
     EvaluateDataQuality().process_rows(
         frame=dynamo_dyf,
         ruleset=DEFAULT_DATA_QUALITY_RULESET, 
@@ -217,6 +312,16 @@ try:
             "observations.scope": "ALL"
         }
     )
+
+
+
+try:
+    # 1. Leer datos de DynamoDB en Virginia (us-east-1)
+    print(f"Leyendo datos desde DynamoDB en región {dynamo_region} (Virginia)...")
+
+    dynamo_dyf = modulo_leer_datos_dynamo()
+    
+    evaluarCalidadDatos(dynamo_dyf)
 
     # Convertir a DataFrame
     dynamo_df = dynamo_dyf.toDF()
@@ -269,24 +374,13 @@ try:
             # Convertir a DynamicFrame
             new_records_dyf = DynamicFrame.fromDF(new_records_prepared, glueContext, "new_records")
             
-            # Configurar sink de S3 en Ohio (us-east-2)
-            print(f"Configurando escritura en S3 región {s3_region} (Ohio)")
-            s3_sink = glueContext.getSink(
-                path=s3_new_records_path,
-                connection_type="s3",
-                updateBehavior="UPDATE_IN_DATABASE",
-                partitionKeys=[],
-                enableUpdateCatalog=True,
-                transformation_ctx="s3_sink"
+            print(f"Configurando escritura de archivos individuales en S3 región {s3_region} (Ohio)")
+            write_by_pk_to_s3(
+                dynamic_frame=new_records_dyf,
+                primary_key=primary_key,
+                target_path=s3_new_records_path,
+                s3_region=s3_region
             )
-            s3_sink.setCatalogInfo(
-                catalogDatabase=catalog_database,
-                catalogTableName=catalog_table_name
-            )
-            s3_sink.setFormat("glueparquet", compression="snappy")
-            
-            # Escribir registros
-            s3_sink.writeFrame(new_records_dyf)
             
             print(f"Escritura completada: {new_records_count} registros escritos en {s3_new_records_path} (región: {s3_region})")
         else:
@@ -305,24 +399,14 @@ try:
         # Convertir a DynamicFrame
         all_records_dyf = DynamicFrame.fromDF(all_records_prepared, glueContext, "all_records")
         
-        # Configurar sink de S3 en Ohio (us-east-2)
-        print(f"Configurando escritura inicial en S3 región {s3_region} (Ohio)")
-        s3_sink = glueContext.getSink(
-            path=s3_new_records_path,
-            connection_type="s3",
-            updateBehavior="UPDATE_IN_DATABASE",
-            partitionKeys=[],
-            enableUpdateCatalog=True,
-            transformation_ctx="s3_sink"
+        # Segunda parte: cuando no hay datos existentes previos
+        print(f"Configurando escritura inicial de archivos individuales en S3 región {s3_region} (Ohio)")
+        write_by_pk_to_s3(
+            dynamic_frame=all_records_dyf,
+            primary_key=primary_key,
+            target_path=s3_new_records_path,
+            s3_region=s3_region
         )
-        s3_sink.setCatalogInfo(
-            catalogDatabase=catalog_database,
-            catalogTableName=catalog_table_name
-        )
-        s3_sink.setFormat("glueparquet", compression="snappy")
-        
-        # Escribir registros
-        s3_sink.writeFrame(all_records_dyf)
         
         print(f"Escritura inicial completada: {total_dynamo_records} registros escritos en {s3_new_records_path}")
 
