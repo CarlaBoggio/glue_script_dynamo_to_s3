@@ -126,8 +126,7 @@ def write_by_pk_to_s3(dynamic_frame, primary_key, target_path):
     
     # Obtener la cantidad total de filas
     total_rows = df.count()
-    print(f"Total de registros a procesar por PK: {total_rows}")
-    
+
     # Obtener todos los valores de clave primaria únicos
     pk_values = [row[primary_key] for row in df.select(primary_key).distinct().collect()]
     print(f"Número de valores de clave primaria únicos: {len(pk_values)}")
@@ -379,7 +378,6 @@ try:
                 dynamic_frame=new_records_dyf,
                 primary_key=primary_key,
                 target_path=s3_new_records_path,
-                s3_region=s3_region
             )
             
             print(f"Escritura completada: {new_records_count} registros escritos en {s3_new_records_path} (región: {s3_region})")
@@ -404,8 +402,7 @@ try:
         write_by_pk_to_s3(
             dynamic_frame=all_records_dyf,
             primary_key=primary_key,
-            target_path=s3_new_records_path,
-            s3_region=s3_region
+            target_path=s3_new_records_path
         )
         
         print(f"Escritura inicial completada: {total_dynamo_records} registros escritos en {s3_new_records_path}")
