@@ -10,7 +10,10 @@ from awsglue.dynamicframe import DynamicFrame
 from awsgluedq.transforms import EvaluateDataQuality
 from pyspark.sql.functions import lit, current_date, current_timestamp, col, hash, struct
 from pyspark.sql.types import StringType, StructType, StructField, MapType
-import pyarrow
+import uuid
+import json
+import os
+
 # Función para obtener el ID de la cuenta AWS
 def get_aws_account_id():
     sts_client = boto3.client('sts')
@@ -34,7 +37,7 @@ required_params = [
 # Obtenemos los parámetros requeridos
 args = getResolvedOptions(sys.argv, required_params)
 
-# Inicializar el contexto y job de Glue
+# Inicializar el contexto y job de Glue - SOLO UNA VEZ
 sc = SparkContext()
 glueContext = GlueContext(sc)
 spark = glueContext.spark_session
@@ -54,7 +57,6 @@ current_region = boto3.session.Session().region_name
 dynamo_account_id = get_aws_account_id()
 
 # Definir parámetros opcionales con valores predeterminados
-# Ya no es necesario pasarlos como argumentos al job
 dynamo_region = "us-east-1"  # Virginia para DynamoDB
 s3_region = "us-east-2"      # Ohio para S3
 s3_temp_bucket = f"aws-glue-assets-{dynamo_account_id}-{current_region}"
@@ -98,103 +100,143 @@ print(f"Usando clave primaria: {primary_key}")
 print(f"Ruta base en S3: {s3_target_path}")
 print(f"Ruta para nuevos registros: {s3_new_records_path}")
 
-def write_by_pk_to_s3(dynamic_frame, primary_key, target_path):
+def write_by_pk_to_s3_parquet_safe(dynamic_frame, primary_key, target_path):
     """
-    Escribe cada fila del DynamicFrame como un archivo Parquet individual en S3.
-    El nombre de cada archivo será el valor de la clave primaria.
+    Escribe cada fila del DynamicFrame como un archivo Parquet individual en S3
+    usando Spark de manera segura, sin crear nuevos SparkContexts.
     
     Args:
         dynamic_frame: DynamicFrame de Glue con los datos a escribir
         primary_key: Nombre de la columna que contiene la clave primaria
         target_path: Ruta en S3 donde se escribirán los archivos
-        s3_region: Región de S3 donde se encuentra el bucket
     """
-    import uuid
-    from pyspark.sql.functions import col
-    import boto3
-    from io import BytesIO
-    import pyarrow as pa
-    import pyarrow.parquet as pq
-    
-    print(f"Escribiendo registros individuales por clave primaria '{primary_key}' en {target_path}...")
-    
-    # Crear cliente S3 con la región específica
-    s3_client = boto3.client('s3', region_name=s3_region)
+    print(f"Escribiendo registros individuales por clave primaria '{primary_key}' en {target_path} como Parquet...")
     
     # Convertir a DataFrame para procesar
     df = dynamic_frame.toDF()
     
     # Obtener la cantidad total de filas
     total_rows = df.count()
-
+    print(f"Total de registros a procesar por PK: {total_rows}")
+    
     # Obtener todos los valores de clave primaria únicos
     pk_values = [row[primary_key] for row in df.select(primary_key).distinct().collect()]
     print(f"Número de valores de clave primaria únicos: {len(pk_values)}")
     
+    # Crear cliente S3 con la región específica
+    s3_client = boto3.client('s3', region_name=s3_region)
+    
+    # Limpiar el target_path para extraer bucket y prefijo
+    target_path_clean = target_path.replace("s3://", "")
+    parts = target_path_clean.split("/", 1)
+    bucket = parts[0]
+    base_prefix = parts[1] if len(parts) > 1 else ""
+    
     success_count = 0
     error_count = 0
     
-    # Procesar cada registro por su clave primaria
-    for pk_value in pk_values:
-        try:
-            if pk_value is None or pk_value == "":
-                # Generar un UUID si la clave primaria es nula o vacía
-                clean_pk = f"unknown_pk_{uuid.uuid4().hex}"
-            else:
-                # Limpiar el valor de la clave primaria para usarlo como nombre de archivo
-                clean_pk = str(pk_value).replace("/", "_").replace("\\", "_").replace(":", "_")
-                clean_pk = clean_pk.replace("*", "_").replace("?", "_").replace("\"", "_")
-                clean_pk = clean_pk.replace("<", "_").replace(">", "_").replace("|", "_")
-                clean_pk = clean_pk.replace(" ", "_")
-            
-            # Filtrar solo la fila con esa clave primaria
-            single_row_df = df.filter(col(primary_key) == pk_value)
-            
-            # Si encontramos la fila, escribirla con el nombre de la clave primaria
-            if single_row_df.count() > 0:
-                # Convertir a PyArrow Table y luego a Parquet
-                pandas_df = single_row_df.toPandas()
-                table = pa.Table.from_pandas(pandas_df)
-                
-                # Escribir a un buffer de memoria
-                buf = BytesIO()
-                pq.write_table(table, buf)
-                buf.seek(0)
-                
-                # Extraer bucket y key del path
-                target_path = target_path.replace("s3://", "")
-                parts = target_path.split("/", 1)
-                bucket = parts[0]
-                
-                # Construir la clave S3 completa
+    # Crear un directorio temporal para almacenar los archivos particionados
+    temp_path = f"s3://{bucket}/{base_prefix}temp_partitioned/"
+    
+    # Asegurarse de que cada tipo de dato sea StringType para preservar valores exactos
+    # Esto evita problemas de conversión de tipos
+    for column_name in df.columns:
+        df = df.withColumn(column_name, col(column_name).cast("string"))
+    
+    try:
+        # Escribir el DataFrame con particionamiento por la clave primaria
+        # Esto creará una estructura de carpetas donde cada valor único del primary_key
+        # tendrá su propia carpeta con un archivo Parquet dentro
+        df.write.mode("overwrite").partitionBy(primary_key).parquet(temp_path)
+        
+        # Listar las carpetas de particiones creadas
+        response = s3_client.list_objects_v2(
+            Bucket=bucket,
+            Prefix=f"{base_prefix}temp_partitioned/"
+        )
+        
+        # Procesar cada partición para renombrar y mover los archivos
+        if 'Contents' in response:
+            # Encontrar todas las carpetas de partición
+            partition_prefixes = set()
+            for obj in response['Contents']:
+                key = obj['Key']
+                # Extraer el prefijo de la partición (hasta y incluyendo el valor de la clave primaria)
+                parts = key.split(f"{primary_key}=")
                 if len(parts) > 1:
-                    folder_prefix = parts[1]
-                    s3_key = f"{folder_prefix}{clean_pk}.parquet"
-                else:
-                    s3_key = f"{clean_pk}.parquet"
+                    pk_value_path = parts[1].split("/")[0]
+                    partition_prefix = f"{parts[0]}{primary_key}={pk_value_path}/"
+                    partition_prefixes.add(partition_prefix)
+            
+            # Procesar cada partición
+            for partition_prefix in partition_prefixes:
+                # Extraer el valor de la clave primaria de la ruta de la partición
+                pk_value_encoded = partition_prefix.split(f"{primary_key}=")[1].strip("/")
                 
-                # Subir el archivo directamente a S3 (no como carpeta)
-                s3_client.put_object(
-                    Bucket=bucket, 
-                    Key=s3_key, 
-                    Body=buf.getvalue()
+                # Decodificar el valor si es necesario (por ejemplo, si contiene caracteres especiales)
+                try:
+                    pk_value = pk_value_encoded.replace("%20", " ")  # Ejemplo de decodificación básica
+                except:
+                    pk_value = pk_value_encoded
+                
+                # Limpiar el valor para usarlo como nombre de archivo
+                if pk_value is None or pk_value == "":
+                    clean_pk = f"unknown_pk_{uuid.uuid4().hex}"
+                else:
+                    clean_pk = str(pk_value).replace("/", "_").replace("\\", "_").replace(":", "_")
+                    clean_pk = clean_pk.replace("*", "_").replace("?", "_").replace("\"", "_")
+                    clean_pk = clean_pk.replace("<", "_").replace(">", "_").replace("|", "_")
+                    clean_pk = clean_pk.replace(" ", "_")
+                
+                # Listar archivos en esta partición
+                partition_files = []
+                partition_response = s3_client.list_objects_v2(
+                    Bucket=bucket,
+                    Prefix=partition_prefix
                 )
                 
-                success_count += 1
-                if success_count % 20 == 0:
-                    print(f"Progreso: {success_count}/{len(pk_values)} registros procesados")
-            else:
-                print(f"Advertencia: No se encontró la fila con PK '{pk_value}'")
+                if 'Contents' in partition_response:
+                    for obj in partition_response['Contents']:
+                        key = obj['Key']
+                        if key.endswith('.parquet'):
+                            partition_files.append(key)
                 
-        except Exception as e:
-            error_count += 1
-            print(f"Error al procesar registro con PK '{pk_value}': {str(e)}")
-            import traceback
-            traceback.print_exc()
+                # Si encontramos archivos en la partición, copiarlos a la ubicación final
+                if partition_files:
+                    # Típicamente solo hay un archivo por partición
+                    source_file = partition_files[0]
+                    
+                    # Construir la ruta final para el archivo
+                    dest_key = f"{base_prefix}{clean_pk}.parquet"
+                    
+                    # Copiar el archivo a la ubicación final con el nombre deseado
+                    s3_client.copy_object(
+                        Bucket=bucket,
+                        CopySource={'Bucket': bucket, 'Key': source_file},
+                        Key=dest_key
+                    )
+                    
+                    success_count += 1
+                    if success_count % 20 == 0:
+                        print(f"Progreso: {success_count}/{len(partition_prefixes)} registros procesados")
+                else:
+                    print(f"Advertencia: No se encontraron archivos Parquet en la partición para PK '{pk_value}'")
+            
+            # Limpiar los archivos temporales
+            print("Limpiando archivos temporales...")
+            for obj in response['Contents']:
+                s3_client.delete_object(Bucket=bucket, Key=obj['Key'])
+                
+        else:
+            print("Error: No se crearon particiones en la carpeta temporal")
+            
+    except Exception as e:
+        print(f"Error durante la escritura particionada: {str(e)}")
+        import traceback
+        traceback.print_exc()
     
-    print(f"Proceso completado: {success_count} registros escritos como archivos individuales, {error_count} errores")
+    print(f"Proceso completado: {success_count} registros escritos como archivos Parquet individuales, {error_count} errores")
     return success_count
-
 
 def modulo_leer_datos_dynamo():
     """
@@ -294,11 +336,9 @@ def modulo_leer_datos_dynamo():
         import traceback
         traceback.print_exc()
         raise Exception(f"Error al procesar DynamoDB: {str(e)}")
-        
-        
-        
+
 def evaluarCalidadDatos(dynamo_dyf):
-        # Evaluar calidad de datos
+    # Evaluar calidad de datos
     EvaluateDataQuality().process_rows(
         frame=dynamo_dyf,
         ruleset=DEFAULT_DATA_QUALITY_RULESET, 
@@ -311,8 +351,6 @@ def evaluarCalidadDatos(dynamo_dyf):
             "observations.scope": "ALL"
         }
     )
-
-
 
 try:
     # 1. Leer datos de DynamoDB en Virginia (us-east-1)
@@ -374,7 +412,8 @@ try:
             new_records_dyf = DynamicFrame.fromDF(new_records_prepared, glueContext, "new_records")
             
             print(f"Configurando escritura de archivos individuales en S3 región {s3_region} (Ohio)")
-            write_by_pk_to_s3(
+            # IMPORTANTE: Usa la nueva función para escribir Parquet de manera segura
+            write_by_pk_to_s3_parquet_safe(
                 dynamic_frame=new_records_dyf,
                 primary_key=primary_key,
                 target_path=s3_new_records_path,
@@ -399,7 +438,8 @@ try:
         
         # Segunda parte: cuando no hay datos existentes previos
         print(f"Configurando escritura inicial de archivos individuales en S3 región {s3_region} (Ohio)")
-        write_by_pk_to_s3(
+        # IMPORTANTE: Usa la nueva función para escribir Parquet de manera segura
+        write_by_pk_to_s3_parquet_safe(
             dynamic_frame=all_records_dyf,
             primary_key=primary_key,
             target_path=s3_new_records_path
