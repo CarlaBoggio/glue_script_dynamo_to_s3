@@ -15,7 +15,13 @@ glue_client = boto3.client('glue')
 job_name = 'generic_extract_table_information_from_dynamo_to_s3'
 
 database = 'general'
-bucket = 'mf-gluesparkscripts'
+bucket = 'pivot-dashboard'
+
+# Nombre del trabajo de Glue para claves primarias compuestas
+composite_pk_job_name = 'extract_table_information_composite_pk'
+
+
+
 
 # Lista de configuraciones (cada elemento es un conjunto de parámetros para una ejecución)
 job_configs = [
@@ -23,57 +29,63 @@ job_configs = [
     {
         '--bucket_name': bucket,
         '--catalog_database': database,
-        '--catalog_table_name': 'users',
+        '--catalog_table_name': 'ERC_USERS_TABLE',
         '--dynamo_table_name': 'ERC_USERS_TABLE',
-        '--folder_name': 'users',
-        '--primary_key': 'id'
+        '--folder_name': 'ERC_USERS_TABLE',
+        '--primary_key': 'id',
+        '--primary_key_is_composite': 'false'
     },
     
     # 2. bd-contracts - contracts
     {
         '--bucket_name': bucket,
         '--catalog_database': database,
-        '--catalog_table_name': 'contracts',
+        '--catalog_table_name': 'ERC_Contracts',
         '--dynamo_table_name': 'ERC_Contracts',
-        '--folder_name': 'contracts',
-        '--primary_key': 'idToken'
+        '--folder_name': 'ERC_Contracts',
+        '--primary_key': 'idToken',
+        '--primary_key_is_composite': 'false'
     },
     
     #3. erc_utilidades - erc_utilidades
     {
         '--bucket_name': bucket,
         '--catalog_database': database,
-        '--catalog_table_name': 'erc_utilidades',
+        '--catalog_table_name': 'ERC_utilidades',
         '--dynamo_table_name': 'ERC_utilidades',
-        '--folder_name': 'ERC_Utilidades',
-        '--primary_key': 'factoryAddress'
+        '--folder_name': 'ERC_utilidades',
+        '--primary_key': 'factoryAddress,splitterAddress',
+        '--primary_key_is_composite': 'true'
     },
-    
-    # 4. user_transactions_target - user_transaction
+    #4. user_transactions_target - user_transaction
     {
         '--bucket_name': bucket,
         '--catalog_database': database,
         '--catalog_table_name': 'user_transaction',
         '--dynamo_table_name': 'users_transactions',
         '--folder_name': 'user-transactions',
-        '--primary_key': 'id'
+        '--primary_key': 'id',
+        '--primary_key_is_composite': 'false'
     },
+    # Country contracts
     {
         '--bucket_name': bucket,
         '--catalog_database': database,
         '--catalog_table_name': 'ERC_COUNTRY_CONTRACTS',
         '--dynamo_table_name': 'ERC_COUNTRY_CONTRACTS',
         '--folder_name': 'ERC_COUNTRY_CONTRACTS',
-        '--primary_key': 'countryAddress'
+        '--primary_key': 'countryAddress',
+        '--primary_key_is_composite': 'false'
     },
         # 5.  ERC Balances
     {
         '--bucket_name': bucket,
         '--catalog_database': database,
-        '--catalog_table_name': 'erc_balances_table',
+        '--catalog_table_name': 'ERC_Balances',
         '--dynamo_table_name': 'ERC_Balances',
         '--folder_name': 'ERC_Balances',
-        '--primary_key': 'walletAddress'
+        '--primary_key': 'walletAddress',
+        '--primary_key_is_composite': 'false'
     }
 ]
 
@@ -109,7 +121,7 @@ def start_job_with_retry(job_name, config):
     
     while (time.time() - start_time) < MAX_WAIT_TIME_SECONDS:
         try:
-            logger.info(f"Intentando iniciar el trabajo con configuración: {json.dumps(config, indent=2)}")
+            logger.info(f"Intentando iniciar el trabajo {job_name} con configuración: {json.dumps(config, indent=2)}")
             response = glue_client.start_job_run(
                 JobName=job_name,
                 Arguments=config
@@ -137,15 +149,28 @@ def run_job_with_configs():
     for i, config in enumerate(job_configs):
         logger.info(f"\n--- Iniciando ejecución {i+1}/{len(job_configs)} ---")
         
+        # Determinar si la clave primaria es compuesta o no
+        is_composite_pk = config.get('--primary_key_is_composite', 'false').lower() == 'true'
+        
+        # Elegir el trabajo correcto según el tipo de clave primaria
+        current_job_name = composite_pk_job_name if is_composite_pk else job_name
+        
+        if is_composite_pk:
+            logger.info(f"Detectada clave primaria compuesta: {config.get('--primary_key')}")
+            logger.info(f"Usando trabajo especializado: {composite_pk_job_name}")
+        else:
+            logger.info(f"Usando clave primaria simple: {config.get('--primary_key')}")
+            logger.info(f"Usando trabajo estándar: {job_name}")
+        
         retry_count = 0
         while retry_count < MAX_RETRIES:
             try:
                 # Intentar iniciar el trabajo (con reintentos si hay errores de concurrencia)
-                run_id = start_job_with_retry(job_name, config)
-                logger.info(f"Trabajo iniciado. Run ID: {run_id}")
+                run_id = start_job_with_retry(current_job_name, config)
+                logger.info(f"Trabajo {current_job_name} iniciado. Run ID: {run_id}")
                 
                 # Esperar a que el trabajo se complete
-                final_status = check_job_status(job_name, run_id)
+                final_status = check_job_status(current_job_name, run_id)
                 
                 logger.info(f"Ejecución {i+1} completada con estado: {final_status}")
                 
@@ -169,6 +194,7 @@ def run_job_with_configs():
         if retry_count >= MAX_RETRIES:
             failed_job = {
                 'config': config,
+                'job_name': current_job_name,
                 'index': i
             }
             failed_jobs.append(failed_job)
@@ -178,12 +204,12 @@ def run_job_with_configs():
     if failed_jobs:
         logger.error(f"\n--- Resumen de trabajos fallidos ({len(failed_jobs)}/{len(job_configs)}) ---")
         for job in failed_jobs:
-            logger.error(f"Trabajo {job['index'] + 1}: {json.dumps(job['config'], indent=2)}")
+            logger.error(f"Trabajo {job['index'] + 1} ({job['job_name']}): {json.dumps(job['config'], indent=2)}")
     else:
         logger.info("\n--- Todos los trabajos se completaron correctamente ---")
 
 if __name__ == "__main__":
-    logger.info(f"Iniciando ejecuciones secuenciales del trabajo: {job_name}")
+    logger.info(f"Iniciando ejecuciones secuenciales de trabajos")
     logger.info(f"Se ejecutarán {len(job_configs)} configuraciones diferentes")
     
     run_job_with_configs()
