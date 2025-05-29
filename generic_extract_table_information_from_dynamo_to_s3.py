@@ -162,10 +162,11 @@ def enforce_unified_schema(df, unified_schema):
     
     return df
 
+
 def write_consistent_parquet_files(df, primary_key, target_path):
     """
     Escribe archivos Parquet individuales con nombres basados en la PK
-    y esquema unificado, directamente en la ruta destino.
+    conservando exactamente los caracteres originales (incluyendo guiones).
     
     Args:
         df: DataFrame con los datos a escribir
@@ -186,12 +187,17 @@ def write_consistent_parquet_files(df, primary_key, target_path):
     # Procesar cada registro individualmente
     for row in df.collect():
         try:
-            # Obtener valor de PK
-            pk_value = str(row[primary_key]) if row[primary_key] else f"null_{uuid.uuid4().hex}"
+            # Obtener valor de PK tal cual
+            pk_value = str(row[primary_key]) if row[primary_key] is not None else f"null_{uuid.uuid4().hex}"
             
-            # Limpiar el nombre de archivo
-            clean_pk = "".join(c if c.isalnum() else "_" for c in pk_value)
-            file_name = f"{clean_pk}.parquet"
+            # Conservar TODOS los caracteres originales en el nombre de archivo
+            file_name = f"{pk_value}.parquet"
+            
+            # Solo reemplazar caracteres que podrían causar problemas con S3
+            # (conservando guiones y la mayoría de caracteres especiales)
+            file_name = file_name.replace(" ", "_")  # Los espacios son problemáticos
+            file_name = file_name.replace("\\", "_")  # Backslashes son problemáticos
+            file_name = file_name.replace(":", "_")  # Dos puntos pueden ser problemáticos en algunos sistemas
             
             # Crear DataFrame temporal con solo este registro
             single_row_df = spark.createDataFrame([row.asDict()], unified_schema)
@@ -200,7 +206,7 @@ def write_consistent_parquet_files(df, primary_key, target_path):
             temp_path = f"s3://{bucket}/temp_{uuid.uuid4()}/"
             single_row_df.write.parquet(temp_path)
             
-            # Mover el archivo a la ubicación final con nombre limpio
+            # Mover el archivo a la ubicación final con nombre exacto
             response = s3_client.list_objects_v2(
                 Bucket=bucket,
                 Prefix=temp_path.replace(f"s3://{bucket}/", "")
@@ -221,6 +227,8 @@ def write_consistent_parquet_files(df, primary_key, target_path):
             continue
 
     print(f"Escritura completada. Archivos Parquet individuales creados en {target_path}")
+    
+    
 def write_by_pk_to_s3_parquet_safe(dynamic_frame, primary_key, target_path):
     """
     Versión mejorada que escribe archivos Parquet con esquema consistente.
