@@ -162,16 +162,15 @@ def enforce_unified_schema(df, unified_schema):
     
     return df
 
-def write_consistent_parquet_files(df, primary_key, target_path, max_records_per_file=1000):
+def write_consistent_parquet_files(df, primary_key, target_path):
     """
-    Escribe archivos Parquet consistentes con un esquema unificado, agrupando registros
-    para optimizar el número de archivos creados.
+    Escribe archivos Parquet individuales con nombres basados en la PK
+    y esquema unificado, directamente en la ruta destino.
     
     Args:
         df: DataFrame con los datos a escribir
         primary_key: Clave primaria para nombrar los archivos
         target_path: Ruta S3 de destino
-        max_records_per_file: Máximo de registros por archivo Parquet
     """
     # Obtener esquema unificado
     unified_schema = get_unified_schema(df)
@@ -179,16 +178,49 @@ def write_consistent_parquet_files(df, primary_key, target_path, max_records_per
     # Aplicar esquema unificado
     df = enforce_unified_schema(df, unified_schema)
     
-    # Dividir en grupos para evitar demasiados archivos pequeños
-    df = df.withColumn("file_group", 
-                      (hash(col(primary_key)) % (df.count() / max_records_per_file + 1)))
+    # Configuración de cliente S3
+    s3_client = boto3.client('s3', region_name=s3_region)
+    bucket = bucket_name
+    base_prefix = folder_name + "/" if folder_name else ""
     
-    # Escribir los archivos Parquet
-    print(f"Escribiendo archivos Parquet consistentes en {target_path}")
-    df.write.partitionBy("file_group").mode("overwrite").parquet(target_path)
-    
-    print("Escritura completada con esquema unificado")
+    # Procesar cada registro individualmente
+    for row in df.collect():
+        try:
+            # Obtener valor de PK
+            pk_value = str(row[primary_key]) if row[primary_key] else f"null_{uuid.uuid4().hex}"
+            
+            # Limpiar el nombre de archivo
+            clean_pk = "".join(c if c.isalnum() else "_" for c in pk_value)
+            file_name = f"{clean_pk}.parquet"
+            
+            # Crear DataFrame temporal con solo este registro
+            single_row_df = spark.createDataFrame([row.asDict()], unified_schema)
+            
+            # Escribir a ubicación temporal
+            temp_path = f"s3://{bucket}/temp_{uuid.uuid4()}/"
+            single_row_df.write.parquet(temp_path)
+            
+            # Mover el archivo a la ubicación final con nombre limpio
+            response = s3_client.list_objects_v2(
+                Bucket=bucket,
+                Prefix=temp_path.replace(f"s3://{bucket}/", "")
+            )
+            
+            if 'Contents' in response:
+                for obj in response['Contents']:
+                    if obj['Key'].endswith('.parquet'):
+                        s3_client.copy_object(
+                            Bucket=bucket,
+                            CopySource={'Bucket': bucket, 'Key': obj['Key']},
+                            Key=f"{base_prefix}{file_name}"
+                        )
+                        s3_client.delete_object(Bucket=bucket, Key=obj['Key'])
+            
+        except Exception as e:
+            print(f"Error procesando PK {pk_value}: {str(e)}")
+            continue
 
+    print(f"Escritura completada. Archivos Parquet individuales creados en {target_path}")
 def write_by_pk_to_s3_parquet_safe(dynamic_frame, primary_key, target_path):
     """
     Versión mejorada que escribe archivos Parquet con esquema consistente.
