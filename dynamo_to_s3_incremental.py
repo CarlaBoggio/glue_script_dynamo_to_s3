@@ -57,7 +57,7 @@ current_region = boto3.session.Session().region_name
 dynamo_account_id = get_aws_account_id()
 
 # Definir parámetros opcionales con valores predeterminados
-dynamo_region = "us-east-1"  # Virginia para DynamoDB
+dynamo_region = "us-east-2"  # Virginia para DynamoDB
 s3_region = "us-east-2"      # Ohio para S3
 s3_temp_bucket = f"aws-glue-assets-{dynamo_account_id}-{current_region}"
 s3_temp_prefix = "temporary/ddbexport/"
@@ -100,139 +100,105 @@ print(f"Usando clave primaria: {primary_key}")
 print(f"Ruta base en S3: {s3_target_path}")
 print(f"Ruta para nuevos registros: {s3_new_records_path}")
 
+def get_unified_schema(df):
+    """
+    Analiza todo el DataFrame para determinar un esquema unificado que contenga todos los campos encontrados.
+    Todos los campos serán convertidos a StringType para mantener consistencia.
+    
+    Args:
+        df: DataFrame de Spark con los datos a analizar
+        
+    Returns:
+        StructType: Esquema unificado que contiene todos los campos encontrados
+    """
+    # Recolectar todos los nombres de columnas de todas las filas
+    all_columns = set()
+    
+    # Usamos el esquema existente como base y exploramos datos para campos adicionales
+    existing_schema = df.schema
+    for field in existing_schema:
+        all_columns.add(field.name)
+    
+    # Si el DataFrame contiene campos de tipo Map o Struct, necesitamos explorar más
+    sample_data = df.limit(1000).collect()  # Muestra para detectar campos adicionales
+    
+    for row in sample_data:
+        for field in row.__fields__:
+            if field not in all_columns:
+                all_columns.add(field)
+    
+    print(f"Esquema unificado contiene {len(all_columns)} campos")
+    
+    # Crear un esquema donde todos los campos son StringType
+    unified_schema = StructType([
+        StructField(col_name, StringType(), True) for col_name in sorted(all_columns)
+    ])
+    
+    return unified_schema
+
+def enforce_unified_schema(df, unified_schema):
+    """
+    Aplica el esquema unificado al DataFrame, asegurando que todos los campos estén presentes
+    y convertidos al tipo correcto (StringType).
+    
+    Args:
+        df: DataFrame original
+        unified_schema: Esquema unificado a aplicar
+        
+    Returns:
+        DataFrame: Nuevo DataFrame con el esquema unificado aplicado
+    """
+    # Convertir todas las columnas existentes a StringType
+    for field in df.schema:
+        df = df.withColumn(field.name, col(field.name).cast("string"))
+    
+    # Añadir columnas faltantes con valor null
+    for field in unified_schema:
+        if field.name not in df.columns:
+            df = df.withColumn(field.name, lit(None).cast("string"))
+    
+    # Seleccionar solo las columnas del esquema unificado en el orden correcto
+    df = df.select([field.name for field in unified_schema])
+    
+    return df
+
+def write_consistent_parquet_files(df, primary_key, target_path, max_records_per_file=1000):
+    """
+    Escribe archivos Parquet consistentes con un esquema unificado, agrupando registros
+    para optimizar el número de archivos creados.
+    
+    Args:
+        df: DataFrame con los datos a escribir
+        primary_key: Clave primaria para nombrar los archivos
+        target_path: Ruta S3 de destino
+        max_records_per_file: Máximo de registros por archivo Parquet
+    """
+    # Obtener esquema unificado
+    unified_schema = get_unified_schema(df)
+    
+    # Aplicar esquema unificado
+    df = enforce_unified_schema(df, unified_schema)
+    
+    # Dividir en grupos para evitar demasiados archivos pequeños
+    df = df.withColumn("file_group", 
+                      (hash(col(primary_key)) % (df.count() / max_records_per_file + 1)))
+    
+    # Escribir los archivos Parquet
+    print(f"Escribiendo archivos Parquet consistentes en {target_path}")
+    df.write.partitionBy("file_group").mode("overwrite").parquet(target_path)
+    
+    print("Escritura completada con esquema unificado")
 
 def write_by_pk_to_s3_parquet_safe(dynamic_frame, primary_key, target_path):
     """
-    Escribe cada fila del DynamicFrame como un archivo Parquet individual en S3
-    usando Spark de manera segura, sin crear nuevos SparkContexts.
-    CORREGIDO: Mantiene la columna de clave primaria en el contenido del archivo.
-    
-    Args:
-        dynamic_frame: DynamicFrame de Glue con los datos a escribir
-        primary_key: Nombre de la columna que contiene la clave primaria
-        target_path: Ruta en S3 donde se escribirán los archivos
+    Versión mejorada que escribe archivos Parquet con esquema consistente.
     """
-    print(f"Escribiendo registros individuales por clave primaria '{primary_key}' en {target_path} como Parquet...")
-    
-    # Convertir a DataFrame para procesar
     df = dynamic_frame.toDF()
     
-    # Obtener la cantidad total de filas
-    total_rows = df.count()
-    print(f"Total de registros a procesar por PK: {total_rows}")
+    # Usar la nueva implementación con esquema unificado
+    write_consistent_parquet_files(df, primary_key, target_path)
     
-    # Obtener todos los valores de clave primaria únicos
-    pk_values = [row[primary_key] for row in df.select(primary_key).distinct().collect()]
-    print(f"Número de valores de clave primaria únicos: {len(pk_values)}")
-    
-    # Crear cliente S3 con la región específica
-    s3_client = boto3.client('s3', region_name=s3_region)
-    
-    # Limpiar el target_path para extraer bucket y prefijo
-    target_path_clean = target_path.replace("s3://", "")
-    parts = target_path_clean.split("/", 1)
-    bucket = parts[0]
-    base_prefix = parts[1] if len(parts) > 1 else ""
-    
-    success_count = 0
-    error_count = 0
-    
-    # Asegurarse de que cada tipo de dato sea StringType para preservar valores exactos
-    # Esto evita problemas de conversión de tipos
-    for column_name in df.columns:
-        df = df.withColumn(column_name, col(column_name).cast("string"))
-    
-    try:
-        # MÉTODO CORREGIDO: Procesar cada valor de clave primaria individualmente
-        # sin usar partitionBy que remueve la columna de clave primaria
-        
-        for pk_value in pk_values:
-            try:
-                # Filtrar el DataFrame para obtener solo las filas con este valor de PK
-                filtered_df = df.filter(col(primary_key) == pk_value)
-                
-                # Verificar que tenemos datos
-                if filtered_df.count() == 0:
-                    print(f"Advertencia: No se encontraron datos para PK '{pk_value}'")
-                    continue
-                
-                # Limpiar el valor para usarlo como nombre de archivo
-                if pk_value is None or pk_value == "":
-                    clean_pk = f"unknown_pk_{uuid.uuid4().hex}"
-                else:
-                    clean_pk = str(pk_value).replace("/", "_").replace("\\", "_").replace(":", "_")
-                    clean_pk = clean_pk.replace("*", "_").replace("?", "_").replace("\"", "_")
-                    clean_pk = clean_pk.replace("<", "_").replace(">", "_").replace("|", "_")
-                    clean_pk = clean_pk.replace(" ", "_")
-                
-                # Crear una ruta temporal única para este registro
-                temp_path = f"s3://{bucket}/{base_prefix}temp_single_{clean_pk}_{uuid.uuid4().hex}/"
-                
-                # Escribir este registro específico como Parquet
-                # IMPORTANTE: NO usar partitionBy aquí para mantener todas las columnas
-                filtered_df.write.mode("overwrite").parquet(temp_path)
-                
-                # Listar los archivos creados en la ruta temporal
-                temp_prefix = temp_path.replace("s3://", "").replace(f"{bucket}/", "")
-                response = s3_client.list_objects_v2(
-                    Bucket=bucket,
-                    Prefix=temp_prefix
-                )
-                
-                # Encontrar el archivo Parquet generado
-                parquet_files = []
-                if 'Contents' in response:
-                    for obj in response['Contents']:
-                        if obj['Key'].endswith('.parquet'):
-                            parquet_files.append(obj['Key'])
-                
-                if parquet_files:
-                    # Típicamente solo hay un archivo, tomar el primero
-                    source_file = parquet_files[0]
-                    
-                    # Construir la ruta final para el archivo
-                    dest_key = f"{base_prefix}{clean_pk}.parquet"
-                    
-                    # Copiar el archivo a la ubicación final con el nombre deseado
-                    s3_client.copy_object(
-                        Bucket=bucket,
-                        CopySource={'Bucket': bucket, 'Key': source_file},
-                        Key=dest_key
-                    )
-                    
-                    # Limpiar el archivo temporal
-                    s3_client.delete_object(Bucket=bucket, Key=source_file)
-                    
-                    success_count += 1
-                    if success_count % 20 == 0:
-                        print(f"Progreso: {success_count}/{len(pk_values)} registros procesados")
-                else:
-                    print(f"Error: No se generó archivo Parquet para PK '{pk_value}'")
-                    error_count += 1
-                
-                # Limpiar cualquier otro archivo temporal que pueda haber quedado
-                if 'Contents' in response:
-                    for obj in response['Contents']:
-                        if obj['Key'] != source_file:  # Si no es el que ya movimos
-                            try:
-                                s3_client.delete_object(Bucket=bucket, Key=obj['Key'])
-                            except:
-                                pass  # Ignorar errores de limpieza
-                        
-            except Exception as e:
-                print(f"Error procesando PK '{pk_value}': {str(e)}")
-                error_count += 1
-                continue
-                
-    except Exception as e:
-        print(f"Error durante la escritura individual: {str(e)}")
-        import traceback
-        traceback.print_exc()
-    
-    print(f"Proceso completado: {success_count} registros escritos como archivos Parquet individuales, {error_count} errores")
-    print(f"IMPORTANTE: Cada archivo mantiene TODAS las columnas incluyendo '{primary_key}'")
-    return success_count
-    
+    return df.count()  
     
     
 def modulo_leer_datos_dynamo():
