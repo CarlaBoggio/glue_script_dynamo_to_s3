@@ -8,9 +8,11 @@ from awsglue.context import GlueContext
 from awsglue.job import Job
 from awsglue.dynamicframe import DynamicFrame
 from awsgluedq.transforms import EvaluateDataQuality
-from pyspark.sql.functions import lit, current_date, current_timestamp, col, hash, struct, concat_ws
+from pyspark.sql.functions import lit, current_date, current_timestamp, col, hash, struct
 from pyspark.sql.types import StringType, StructType, StructField, MapType
-import pyarrow
+import uuid
+import json
+import os
 
 # Función para obtener el ID de la cuenta AWS
 def get_aws_account_id():
@@ -27,16 +29,15 @@ required_params = [
     'dynamo_table_name',          # Nombre de la tabla en DynamoDB
     'bucket_name',                # Nombre del bucket S3
     'folder_name',                # Nombre de la carpeta en S3
-    'primary_key',                # Clave primaria de la tabla (separada por comas para composite)
+    'primary_key',                # Clave primaria de la tabla
     'catalog_database',           # Base de datos del catálogo
     'catalog_table_name',         # Nombre de la tabla en el catálogo
-    'primary_key_is_composite'    # Debe ser 'true' para este trabajo
 ]
 
 # Obtenemos los parámetros requeridos
 args = getResolvedOptions(sys.argv, required_params)
 
-# Inicializar el contexto y job de Glue
+# Inicializar el contexto y job de Glue - SOLO UNA VEZ
 sc = SparkContext()
 glueContext = GlueContext(sc)
 spark = glueContext.spark_session
@@ -47,18 +48,9 @@ job.init(args['JOB_NAME'], args)
 dynamo_table_name = args['dynamo_table_name']
 bucket_name = args['bucket_name']
 folder_name = args['folder_name']
+primary_key = args['primary_key']
 catalog_database = args['catalog_database']
 catalog_table_name = args['catalog_table_name']
-primary_key = args['primary_key']
-
-# Verificar que primary_key_is_composite sea true
-if args['primary_key_is_composite'].lower() != 'true':
-    print("ADVERTENCIA: Este trabajo está diseñado para claves primarias compuestas. El parámetro 'primary_key_is_composite' debe ser 'true'.")
-    print("Continuando de todos modos asumiendo que la clave primaria es compuesta.")
-
-# Separar las claves compuestas
-composite_keys = primary_key.split(',')
-print(f"Claves primarias compuestas: {composite_keys}")
 
 # Obtener región actual de ejecución de Glue
 current_region = boto3.session.Session().region_name
@@ -104,245 +96,151 @@ print(f"Procesando tabla DynamoDB: {dynamo_table_name}")
 print(f"Región de DynamoDB: {dynamo_region}, Cuenta: {dynamo_account_id}")
 print(f"Región de S3 destino: {s3_region}")
 print(f"Región donde se ejecuta Glue: {current_region}")
+print(f"Usando clave primaria: {primary_key}")
 print(f"Ruta base en S3: {s3_target_path}")
 print(f"Ruta para nuevos registros: {s3_new_records_path}")
 
-
-from pyspark.sql.types import _parse_datatype_string
-
-def infer_unified_schema_with_composite_keys(df, composite_keys):
+def get_unified_schema(df):
     """
-    Infiere un esquema unificado que:
-    1. Captura todos los campos encontrados en los datos
-    2. Respeta los tipos de datos originales cuando es posible
-    3. Asegura que las claves compuestas tengan el tipo correcto
+    Analiza todo el DataFrame para determinar un esquema unificado que contenga todos los campos encontrados.
+    Todos los campos serán convertidos a StringType para mantener consistencia.
     
     Args:
-        df: DataFrame de Spark con los datos
-        composite_keys: Lista de nombres de columnas que forman la PK compuesta
+        df: DataFrame de Spark con los datos a analizar
         
     Returns:
-        StructType: Esquema unificado con todos los campos
+        StructType: Esquema unificado que contiene todos los campos encontrados
     """
-    # Paso 1: Recolectar todos los nombres de campos
-    all_fields = set(df.columns)
+    # Recolectar todos los nombres de columnas de todas las filas
+    all_columns = set()
     
-    # Paso 2: Analizar una muestra para detectar campos anidados
-    sample_size = min(1000, df.count())
-    sample_data = df.limit(sample_size).collect()
+    # Usamos el esquema existente como base y exploramos datos para campos adicionales
+    existing_schema = df.schema
+    for field in existing_schema:
+        all_columns.add(field.name)
+    
+    # Si el DataFrame contiene campos de tipo Map o Struct, necesitamos explorar más
+    sample_data = df.limit(1000).collect()  # Muestra para detectar campos adicionales
     
     for row in sample_data:
-        for field_name in row.__fields__:
-            if field_name not in all_fields:
-                all_fields.add(field_name)
+        for field in row.__fields__:
+            if field not in all_columns:
+                all_columns.add(field)
     
-    print(f"Campos detectados: {len(all_fields)} (incluyendo {len(composite_keys)} claves primarias)")
+    print(f"Esquema unificado contiene {len(all_columns)} campos")
     
-    # Paso 3: Inferir tipos para cada campo
-    schema_fields = []
-    type_samples = {}
-    
-    # Primero procesamos las claves primarias para asegurar su tipo
-    for pk in composite_keys:
-        if pk not in all_fields:
-            raise ValueError(f"Clave primaria '{pk}' no encontrada en los datos")
-        
-        # Muestrear valores para inferir tipo
-        pk_samples = df.select(pk).limit(100).collect()
-        pk_type = _infer_type_from_samples([row[pk] for row in pk_samples])
-        
-        print(f"Tipo inferido para clave primaria '{pk}': {pk_type}")
-        schema_fields.append(StructField(pk, pk_type, False))  # Claves no nulas
-        type_samples[pk] = pk_type
-    
-    # Luego procesamos el resto de los campos
-    for field in sorted(all_fields - set(composite_keys)):
-        # Si ya procesamos este campo como PK, lo saltamos
-        if field in composite_keys:
-            continue
-            
-        # Muestrear valores para inferir tipo
-        field_samples = df.select(field).limit(100).collect()
-        field_type = _infer_type_from_samples([row[field] for row in field_samples])
-        
-        schema_fields.append(StructField(field, field_type, True))  # Campos normales pueden ser nulos
-        type_samples[field] = field_type
-    
-    unified_schema = StructType(schema_fields)
-    
-    # Validación final
-    _validate_schema_with_composite_keys(unified_schema, composite_keys)
+    # Crear un esquema donde todos los campos son StringType
+    unified_schema = StructType([
+        StructField(col_name, StringType(), True) for col_name in sorted(all_columns)
+    ])
     
     return unified_schema
 
-def _infer_type_from_samples(samples):
+def enforce_unified_schema(df, unified_schema):
     """
-    Infiere el tipo de datos Spark apropiado a partir de una muestra de valores.
-    """
-    from pyspark.sql.types import (StringType, IntegerType, LongType, 
-                                  DoubleType, BooleanType, TimestampType,
-                                  DateType, BinaryType)
+    Aplica el esquema unificado al DataFrame, asegurando que todos los campos estén presentes
+    y convertidos al tipo correcto (StringType).
     
-    # Filtramos valores nulos
-    non_null_samples = [x for x in samples if x is not None]
-    
-    if not non_null_samples:
-        return StringType()  # Default para columnas completamente nulas
-    
-    # Chequear tipos específicos en orden de preferencia
-    sample = non_null_samples[0]
-    
-    # 1. Boolean
-    if isinstance(sample, bool):
-        if all(isinstance(x, bool) or x is None for x in samples):
-            return BooleanType()
-    
-    # 2. Números enteros
-    try:
-        if all(isinstance(x, int) and not isinstance(x, bool) or x is None for x in samples):
-            if all(-2147483648 <= x <= 2147483647 for x in non_null_samples):
-                return IntegerType()
-            return LongType()
-    except:
-        pass
-    
-    # 3. Números decimales
-    try:
-        if all(isinstance(x, (int, float)) or x is None for x in samples):
-            return DoubleType()
-    except:
-        pass
-    
-    # 4. Fechas y timestamps (manejo especial para strings)
-    if isinstance(sample, str):
-        try:
-            from dateutil.parser import parse
-            if len(sample) == 10 and sample[4] == '-' and sample[7] == '-':
-                if all(parse(x).date() if x else True for x in non_null_samples):
-                    return DateType()
-            else:
-                if all(parse(x) if x else True for x in non_null_samples):
-                    return TimestampType()
-        except:
-            pass
-    
-    # 5. Binarios
-    if isinstance(sample, (bytes, bytearray)):
-        return BinaryType()
-    
-    # Default a String
-    return StringType()
-
-def _validate_schema_with_composite_keys(schema, composite_keys):
-    """
-    Valida que el esquema sea compatible con las claves primarias compuestas.
-    """
-    schema_fields = {field.name: field for field in schema.fields}
-    
-    for pk in composite_keys:
-        if pk not in schema_fields:
-            raise ValueError(f"Clave primaria '{pk}' no encontrada en el esquema")
+    Args:
+        df: DataFrame original
+        unified_schema: Esquema unificado a aplicar
         
-        if schema_fields[pk].nullable:
-            raise ValueError(f"Clave primaria '{pk}' no puede ser nullable")
+    Returns:
+        DataFrame: Nuevo DataFrame con el esquema unificado aplicado
+    """
+    # Convertir todas las columnas existentes a StringType
+    for field in df.schema:
+        df = df.withColumn(field.name, col(field.name).cast("string"))
+    
+    # Añadir columnas faltantes con valor null
+    for field in unified_schema:
+        if field.name not in df.columns:
+            df = df.withColumn(field.name, lit(None).cast("string"))
+    
+    # Seleccionar solo las columnas del esquema unificado en el orden correcto
+    df = df.select([field.name for field in unified_schema])
+    
+    return df
 
-def enforce_schema_with_composite_keys(df, unified_schema, composite_keys):
+
+def write_consistent_parquet_files(df, primary_key, target_path):
     """
-    Aplica el esquema unificado al DataFrame, asegurando:
-    1. Todas las columnas están presentes
-    2. Las claves primarias no son nulas
-    3. Los tipos de datos son correctos
+    Escribe archivos Parquet individuales con nombres basados en la PK
+    conservando exactamente los caracteres originales (incluyendo guiones).
+    
+    Args:
+        df: DataFrame con los datos a escribir
+        primary_key: Clave primaria para nombrar los archivos
+        target_path: Ruta S3 de destino
     """
-    # Paso 1: Asegurar que todas las columnas existan
-    existing_cols = set(df.columns)
+    # Obtener esquema unificado
+    unified_schema = get_unified_schema(df)
     
-    for field in unified_schema:
-        if field.name not in existing_cols:
-            df = df.withColumn(field.name, lit(None).cast(field.dataType))
+    # Aplicar esquema unificado
+    df = enforce_unified_schema(df, unified_schema)
     
-    # Paso 2: Convertir tipos manteniendo las claves primarias
-    for field in unified_schema:
-        if field.name in composite_keys:
-            # Para claves primarias, usar coalesce para evitar nulos
-            df = df.withColumn(
-                field.name, 
-                coalesce(col(field.name).cast(field.dataType), 
-                         lit("NULL_" + field.name))  # Valor por defecto seguro
+    # Configuración de cliente S3
+    s3_client = boto3.client('s3', region_name=s3_region)
+    bucket = bucket_name
+    base_prefix = folder_name + "/" if folder_name else ""
+    
+    # Procesar cada registro individualmente
+    for row in df.collect():
+        try:
+            # Obtener valor de PK tal cual
+            pk_value = str(row[primary_key]) if row[primary_key] is not None else f"null_{uuid.uuid4().hex}"
+            
+            # Conservar TODOS los caracteres originales en el nombre de archivo
+            file_name = f"{pk_value}.parquet"
+            
+            # Solo reemplazar caracteres que podrían causar problemas con S3
+            # (conservando guiones y la mayoría de caracteres especiales)
+            file_name = file_name.replace(" ", "_")  # Los espacios son problemáticos
+            file_name = file_name.replace("\\", "_")  # Backslashes son problemáticos
+            file_name = file_name.replace(":", "_")  # Dos puntos pueden ser problemáticos en algunos sistemas
+            
+            # Crear DataFrame temporal con solo este registro
+            single_row_df = spark.createDataFrame([row.asDict()], unified_schema)
+            
+            # Escribir a ubicación temporal
+            temp_path = f"s3://{bucket}/temp_{uuid.uuid4()}/"
+            single_row_df.write.parquet(temp_path)
+            
+            # Mover el archivo a la ubicación final con nombre exacto
+            response = s3_client.list_objects_v2(
+                Bucket=bucket,
+                Prefix=temp_path.replace(f"s3://{bucket}/", "")
             )
-        else:
-            df = df.withColumn(field.name, col(field.name).cast(field.dataType))
-    
-    # Paso 3: Seleccionar solo las columnas del esquema en el orden correcto
-    return df.select([field.name for field in unified_schema])
+            
+            if 'Contents' in response:
+                for obj in response['Contents']:
+                    if obj['Key'].endswith('.parquet'):
+                        s3_client.copy_object(
+                            Bucket=bucket,
+                            CopySource={'Bucket': bucket, 'Key': obj['Key']},
+                            Key=f"{base_prefix}{file_name}"
+                        )
+                        s3_client.delete_object(Bucket=bucket, Key=obj['Key'])
+            
+        except Exception as e:
+            print(f"Error procesando PK {pk_value}: {str(e)}")
+            continue
 
-def write_by_composite_pk_to_s3(dynamic_frame, composite_keys, target_path, s3_region):
+    print(f"Escritura completada. Archivos Parquet individuales creados en {target_path}")
+    
+    
+def write_by_pk_to_s3_parquet_safe(dynamic_frame, primary_key, target_path):
     """
-    Versión final optimizada que:
-    1. Infiere y aplica esquema unificado
-    2. Genera archivos .parquet con nombres basados en PKs compuestas
-    3. Escribe directamente en S3 sin subcarpetas adicionales
+    Versión mejorada que escribe archivos Parquet con esquema consistente.
     """
-    # Convertir a DataFrame
     df = dynamic_frame.toDF()
     
-    # Paso 1: Inferir esquema unificado
-    unified_schema = infer_unified_schema_with_composite_keys(df, composite_keys)
-    print("Esquema unificado inferido:")
-    unified_schema.printTreeString()
+    # Usar la nueva implementación con esquema unificado
+    write_consistent_parquet_files(df, primary_key, target_path)
     
-    # Paso 2: Aplicar esquema
-    df = enforce_schema_with_composite_keys(df, unified_schema, composite_keys)
+    return df.count()  
     
-    # Configurar cliente S3
-    s3_client = boto3.client('s3', region_name=s3_region)
-    target_path = target_path.replace("s3://", "")
-    bucket, prefix = target_path.split("/", 1) if "/" in target_path else (target_path, "")
     
-    # Paso 3: Procesar por combinaciones únicas de PKs
-    pk_combinations = df.select(composite_keys).distinct().rdd.collect()
-    
-    for combo in pk_combinations:
-        try:
-            # Construir condiciones de filtro
-            filter_cond = None
-            pk_values = []
-            
-            for key in composite_keys:
-                val = combo[key]
-                pk_values.append(str(val) if val is not None else "NULL")
-                
-                if filter_cond is None:
-                    filter_cond = (col(key) == val)
-                else:
-                    filter_cond = filter_cond & (col(key) == val)
-            
-            # Filtrar y escribir
-            filtered_df = df.filter(filter_cond)
-            
-            # Generar nombre de archivo seguro
-            pk_filename = "_".join(pk_values)
-            pk_filename = "".join(c if c.isalnum() or c in ('_', '-') else '_' for c in pk_filename)
-            filename = f"{prefix}{pk_filename}.parquet"
-            
-            # Escribir directamente a S3 usando Arrow
-            pandas_df = filtered_df.toPandas()
-            
-            with pa.BufferOutputStream() as buf:
-                pq.write_table(pa.Table.from_pandas(pandas_df), buf)
-                s3_client.put_object(
-                    Bucket=bucket,
-                    Key=filename,
-                    Body=buf.getvalue().to_pybytes()
-                )
-                
-        except Exception as e:
-            print(f"Error procesando combinación {pk_values}: {str(e)}")
-            continue
-    
-    print(f"Proceso completado. Archivos escritos en s3://{bucket}/{prefix}")
-
-
-
 def modulo_leer_datos_dynamo():
     """
     Lee datos de una tabla DynamoDB y los convierte a un formato adecuado para Spark.
@@ -441,8 +339,7 @@ def modulo_leer_datos_dynamo():
         import traceback
         traceback.print_exc()
         raise Exception(f"Error al procesar DynamoDB: {str(e)}")
-        
-        
+
 def evaluarCalidadDatos(dynamo_dyf):
     # Evaluar calidad de datos
     EvaluateDataQuality().process_rows(
@@ -457,7 +354,6 @@ def evaluarCalidadDatos(dynamo_dyf):
             "observations.scope": "ALL"
         }
     )
-
 
 try:
     # 1. Leer datos de DynamoDB en Virginia (us-east-1)
@@ -496,11 +392,9 @@ try:
         
         # 3. Identificar registros nuevos (no existen en S3)
         print("Identificando registros nuevos...")
-        
-        # Para clave compuesta, usamos todas las columnas de clave primaria para el join
         new_records_df = dynamo_df.join(
             existing_s3_df,
-            on=composite_keys,
+            on=primary_key,
             how="left_anti"
         )
         
@@ -521,12 +415,11 @@ try:
             new_records_dyf = DynamicFrame.fromDF(new_records_prepared, glueContext, "new_records")
             
             print(f"Configurando escritura de archivos individuales en S3 región {s3_region} (Ohio)")
-            # Llamada a la función especializada para claves primarias compuestas
-            write_by_composite_pk_to_s3(
+            # IMPORTANTE: Usa la nueva función para escribir Parquet de manera segura
+            write_by_pk_to_s3_parquet_safe(
                 dynamic_frame=new_records_dyf,
-                composite_keys=composite_keys,
+                primary_key=primary_key,
                 target_path=s3_new_records_path,
-                s3_region=s3_region
             )
             
             print(f"Escritura completada: {new_records_count} registros escritos en {s3_new_records_path} (región: {s3_region})")
@@ -548,16 +441,14 @@ try:
         
         # Segunda parte: cuando no hay datos existentes previos
         print(f"Configurando escritura inicial de archivos individuales en S3 región {s3_region} (Ohio)")
-        # Llamada a la función especializada para claves primarias compuestas
-        write_by_composite_pk_to_s3(
+        # IMPORTANTE: Usa la nueva función para escribir Parquet de manera segura
+        write_by_pk_to_s3_parquet_safe(
             dynamic_frame=all_records_dyf,
-            composite_keys=composite_keys,
-            target_path=s3_new_records_path,
-            s3_region=s3_region
+            primary_key=primary_key,
+            target_path=s3_new_records_path
         )
         
         print(f"Escritura inicial completada: {total_dynamo_records} registros escritos en {s3_new_records_path}")
-
 
 except Exception as e:
     print(f"Error durante la ejecución del job: {str(e)}")
