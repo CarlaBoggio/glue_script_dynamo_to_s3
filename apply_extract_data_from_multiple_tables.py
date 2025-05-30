@@ -25,27 +25,27 @@ composite_pk_job_name = 'extract_table_information_composite_pk'
 
 # Lista de configuraciones (cada elemento es un conjunto de parámetros para una ejecución)
 job_configs = [
-    #1. bd_users_table - users
-    {
-        '--bucket_name': bucket,
-        '--catalog_database': database,
-        '--catalog_table_name': 'ERC_USERS_TABLE',
-        '--dynamo_table_name': 'ERC_USERS_TABLE',
-        '--folder_name': 'ERC_USERS_TABLE',
-        '--primary_key': 'id',
-        '--primary_key_is_composite': 'false'
-    },
+    # #1. bd_users_table - users
+    # {
+    #     '--bucket_name': bucket,
+    #     '--catalog_database': database,
+    #     '--catalog_table_name': 'ERC_USERS_TABLE',
+    #     '--dynamo_table_name': 'ERC_USERS_TABLE',
+    #     '--folder_name': 'ERC_USERS_TABLE',
+    #     '--primary_key': 'id',
+    #     '--primary_key_is_composite': 'false'
+    # },
     
-    # 2. bd-contracts - contracts
-    {
-        '--bucket_name': bucket,
-        '--catalog_database': database,
-        '--catalog_table_name': 'ERC_Contracts',
-        '--dynamo_table_name': 'ERC_Contracts',
-        '--folder_name': 'ERC_Contracts',
-        '--primary_key': 'idToken',
-        '--primary_key_is_composite': 'false'
-    },
+    # # 2. bd-contracts - contracts
+    # {
+    #     '--bucket_name': bucket,
+    #     '--catalog_database': database,
+    #     '--catalog_table_name': 'ERC_Contracts',
+    #     '--dynamo_table_name': 'ERC_Contracts',
+    #     '--folder_name': 'ERC_Contracts',
+    #     '--primary_key': 'idToken',
+    #     '--primary_key_is_composite': 'false'
+    # },
     
     #3. erc_utilidades - erc_utilidades
     {
@@ -57,36 +57,36 @@ job_configs = [
         '--primary_key': 'factoryAddress,splitterAddress',
         '--primary_key_is_composite': 'true'
     },
-    #4. user_transactions_target - user_transaction
-    {
-        '--bucket_name': bucket,
-        '--catalog_database': database,
-        '--catalog_table_name': 'user_transaction',
-        '--dynamo_table_name': 'users_transactions',
-        '--folder_name': 'user-transactions',
-        '--primary_key': 'id',
-        '--primary_key_is_composite': 'false'
-    },
-    # Country contracts
-    {
-        '--bucket_name': bucket,
-        '--catalog_database': database,
-        '--catalog_table_name': 'ERC_COUNTRY_CONTRACTS',
-        '--dynamo_table_name': 'ERC_COUNTRY_CONTRACTS',
-        '--folder_name': 'ERC_COUNTRY_CONTRACTS',
-        '--primary_key': 'countryAddress',
-        '--primary_key_is_composite': 'false'
-    },
-        # 5.  ERC Balances
-    {
-        '--bucket_name': bucket,
-        '--catalog_database': database,
-        '--catalog_table_name': 'ERC_Balances',
-        '--dynamo_table_name': 'ERC_Balances',
-        '--folder_name': 'ERC_Balances',
-        '--primary_key': 'walletAddress',
-        '--primary_key_is_composite': 'false'
-    }
+    # #4. user_transactions_target - user_transaction
+    # {
+    #     '--bucket_name': bucket,
+    #     '--catalog_database': database,
+    #     '--catalog_table_name': 'user_transaction',
+    #     '--dynamo_table_name': 'users_transactions',
+    #     '--folder_name': 'user-transactions',
+    #     '--primary_key': 'id',
+    #     '--primary_key_is_composite': 'false'
+    # },
+    # # Country contracts
+    # {
+    #     '--bucket_name': bucket,
+    #     '--catalog_database': database,
+    #     '--catalog_table_name': 'ERC_COUNTRY_CONTRACTS',
+    #     '--dynamo_table_name': 'ERC_COUNTRY_CONTRACTS',
+    #     '--folder_name': 'ERC_COUNTRY_CONTRACTS',
+    #     '--primary_key': 'countryAddress',
+    #     '--primary_key_is_composite': 'false'
+    # },
+    #     # 5.  ERC Balances
+    # {
+    #     '--bucket_name': bucket,
+    #     '--catalog_database': database,
+    #     '--catalog_table_name': 'ERC_Balances',
+    #     '--dynamo_table_name': 'ERC_Balances',
+    #     '--folder_name': 'ERC_Balances',
+    #     '--primary_key': 'walletAddress',
+    #     '--primary_key_is_composite': 'false'
+    # }
 ]
 
 # Tiempo máximo de espera para intentar iniciar un job (30 minutos)
