@@ -1,6 +1,7 @@
 import sys
 import datetime
 import boto3
+import uuid
 from awsglue.transforms import *
 from awsglue.utils import getResolvedOptions
 from pyspark.context import SparkContext
@@ -282,15 +283,21 @@ def write_consistent_parquet_files(df, primary_key, target_path, is_composite=Fa
     """
     # Configuración S3
     s3_client = boto3.client('s3', region_name=s3_region)
-    target_path = target_path.replace("s3://", "")
-    bucket, prefix = target_path.split("/", 1) if "/" in target_path else (target_path, "")
+    bucket = target_path.replace("s3://", "").split("/")[0]
+    prefix = target_path.replace(f"s3://{bucket}/", "")
     
     if is_composite:
         # Procesamiento para PK compuesta
-        composite_keys = primary_key if isinstance(primary_key, list) else primary_key.split(',')
+        if isinstance(primary_key, str):
+            composite_keys = primary_key.split(',')
+        else:
+            composite_keys = primary_key
+        
+        print(f"Procesando {df.count()} registros con claves compuestas: {composite_keys}")
         
         # Obtener combinaciones únicas de PKs
         pk_combinations = df.select(composite_keys).distinct().collect()
+        print(f"Encontradas {len(pk_combinations)} combinaciones únicas de PK")
         
         for combo in pk_combinations:
             try:
@@ -308,26 +315,50 @@ def write_consistent_parquet_files(df, primary_key, target_path, is_composite=Fa
                         filter_cond = filter_cond & (col(key) == val)
                 
                 # Generar nombre de archivo exacto con los valores PK
-                pk_filename = "-".join(pk_values)  # Usamos guiones para unir valores compuestos
+                pk_filename = "_".join(pk_values)
+                # Reemplazar solo caracteres problemáticos para S3
+                pk_filename = pk_filename.replace(" ", "_").replace("\\", "_").replace(":", "_")
                 file_name = f"{pk_filename}.parquet"
                 
-                # Filtrar y escribir los registros con esta PK
+                # Filtrar los registros con esta PK
                 filtered_df = df.filter(filter_cond)
-                _write_single_parquet_to_s3(filtered_df, s3_client, bucket, prefix, file_name)
+                print(f"Escribiendo {filtered_df.count()} registros para PK: {pk_values}")
+                
+                # Escribir temporalmente
+                temp_path = f"s3://{bucket}/temp_{uuid.uuid4()}/"
+                filtered_df.write.mode("overwrite").parquet(temp_path)
+                
+                # Mover a ubicación final
+                response = s3_client.list_objects_v2(
+                    Bucket=bucket,
+                    Prefix=temp_path.replace(f"s3://{bucket}/", "")
+                )
+                
+                if 'Contents' in response:
+                    for obj in response['Contents']:
+                        if obj['Key'].endswith('.parquet'):
+                            s3_client.copy_object(
+                                Bucket=bucket,
+                                CopySource={'Bucket': bucket, 'Key': obj['Key']},
+                                Key=f"{prefix}{file_name}"
+                            )
+                            s3_client.delete_object(Bucket=bucket, Key=obj['Key'])
+                            print(f"Archivo movido a: {prefix}{file_name}")
                 
             except Exception as e:
                 print(f"Error procesando combinación {pk_values}: {str(e)}")
+                import traceback
+                traceback.print_exc()
+                raise e
     else:
         # Procesamiento para PK simple
         for row in df.collect():
-            try:
-                pk_value = str(row[primary_key]) if row[primary_key] is not None else f"null_{uuid.uuid4().hex}"
-                file_name = f"{pk_value}.parquet"  # Nombre exacto con la PK
-                single_row_df = spark.createDataFrame([row.asDict()], df.schema)
-                _write_single_parquet_to_s3(single_row_df, s3_client, bucket, prefix, file_name)
+            
+            pk_value = str(row[primary_key]) if row[primary_key] is not None else f"null_{uuid.uuid4().hex}"
+            file_name = f"{pk_value}.parquet"  # Nombre exacto con la PK
+            single_row_df = spark.createDataFrame([row.asDict()], df.schema)
+            _write_single_parquet_to_s3(single_row_df, s3_client, bucket, prefix, file_name)
                 
-            except Exception as e:
-                print(f"Error procesando PK {pk_value}: {str(e)}")
 
     print(f"Escritura completada en s3://{bucket}/{prefix}")
 
@@ -360,98 +391,92 @@ def modulo_leer_datos_dynamo():
     se procesen correctamente.
     """
     print(f"Conectando a DynamoDB en región {dynamo_region}...")
+
+
+    # Usar cliente de bajo nivel para obtener datos en formato nativo de DynamoDB
+    dynamodb = boto3.client('dynamodb', region_name=dynamo_region)
     
-    try:
-        # Usar cliente de bajo nivel para obtener datos en formato nativo de DynamoDB
-        dynamodb = boto3.client('dynamodb', region_name=dynamo_region)
-        
-        print(f"Escaneando tabla {dynamo_table_name}...")
-        response = dynamodb.scan(TableName=dynamo_table_name)
-        items = response['Items']
-        
-        # Obtener todos los items en caso de paginación
-        while 'LastEvaluatedKey' in response:
-            print(f"Recuperando más registros (paginación)...")
-            response = dynamodb.scan(
-                TableName=dynamo_table_name,
-                ExclusiveStartKey=response['LastEvaluatedKey']
-            )
-            items.extend(response['Items'])
-        
-        # Mostrar información de diagnóstico
-        print(f"Total de registros recuperados: {len(items)}")
-        if items:
-            print(f"Ejemplo del primer item (primeros 3 campos):")
-            sample_item = items[0]
-            sample_keys = list(sample_item.keys())[:3]
-            for key in sample_keys:
-                print(f"  {key}: {sample_item[key]}")
-        
-        # Procesar los items para convertir todo a strings
-        processed_items = []
-        for item in items:
-            processed_item = {}
-            for key, value in item.items():
-                if 'S' in value:  # String
-                    processed_item[key] = value['S']
-                elif 'N' in value:  # Number
-                    processed_item[key] = value['N']
-                elif 'BOOL' in value:  # Boolean
-                    # Convertir a 'true' o 'false' (minúsculas) para consistencia
-                    processed_item[key] = str(value['BOOL']).lower()
-                elif 'L' in value:  # List
-                    processed_item[key] = str(value['L'])
-                elif 'M' in value:  # Map
-                    processed_item[key] = str(value['M'])
-                elif 'NULL' in value:  # Null
-                    processed_item[key] = "null"
-                elif 'B' in value:  # Binary
-                    processed_item[key] = "[binary data]"
-                elif 'SS' in value:  # String Set
-                    processed_item[key] = str(value['SS'])
-                elif 'NS' in value:  # Number Set
-                    processed_item[key] = str(value['NS'])
-                elif 'BS' in value:  # Binary Set
-                    processed_item[key] = "[binary set data]"
-                else:
-                    # Para cualquier otro formato no reconocido
-                    processed_item[key] = str(value)
-            
-            processed_items.append(processed_item)
-        
-        # Determinar un schema común basado en todos los campos encontrados
-        all_fields = set()
-        for item in processed_items:
-            all_fields.update(item.keys())
-        
-        print(f"Campos encontrados en la tabla: {', '.join(sorted(all_fields))}")
-        
-        # Asegurarse de que cada item tenga todos los campos (con valores nulos si es necesario)
-        for item in processed_items:
-            for field in all_fields:
-                if field not in item:
-                    item[field] = None
-        
-        # Crear un DataFrame con todos los campos como StringType
-        if processed_items:
-            schema_fields = [StructField(key, StringType(), True) for key in all_fields]
-            schema = StructType(schema_fields)
-            
-            print(f"Creando DataFrame con {len(schema_fields)} columnas...")
-            items_df = spark.createDataFrame(processed_items, schema=schema)
-            
-            # Convertir a DynamicFrame y retornar
-            return DynamicFrame.fromDF(items_df, glueContext, "dynamo_dyf")
-        else: 
-            raise Exception("No hay elementos en la tabla para procesar")
+    print(f"Escaneando tabla {dynamo_table_name}...")
+    response = dynamodb.scan(TableName=dynamo_table_name)
+    items = response['Items']
     
-    except Exception as e:
-        print(f"Error al leer datos de DynamoDB: {str(e)}")
-        print(f"Tipo de error: {type(e).__name__}")
-        import traceback
-        traceback.print_exc()
-        raise Exception(f"Error al procesar DynamoDB: {str(e)}")
+    # Obtener todos los items en caso de paginación
+    while 'LastEvaluatedKey' in response:
+        print(f"Recuperando más registros (paginación)...")
+        response = dynamodb.scan(
+            TableName=dynamo_table_name,
+            ExclusiveStartKey=response['LastEvaluatedKey']
+        )
+        items.extend(response['Items'])
+    
+    # Mostrar información de diagnóstico
+    print(f"Total de registros recuperados: {len(items)}")
+    if items:
+        print(f"Ejemplo del primer item (primeros 3 campos):")
+        sample_item = items[0]
+        sample_keys = list(sample_item.keys())[:3]
+        for key in sample_keys:
+            print(f"  {key}: {sample_item[key]}")
+    
+    # Procesar los items para convertir todo a strings
+    processed_items = []
+    for item in items:
+        processed_item = {}
+        for key, value in item.items():
+            if 'S' in value:  # String
+                processed_item[key] = value['S']
+            elif 'N' in value:  # Number
+                processed_item[key] = value['N']
+            elif 'BOOL' in value:  # Boolean
+                # Convertir a 'true' o 'false' (minúsculas) para consistencia
+                processed_item[key] = str(value['BOOL']).lower()
+            elif 'L' in value:  # List
+                processed_item[key] = str(value['L'])
+            elif 'M' in value:  # Map
+                processed_item[key] = str(value['M'])
+            elif 'NULL' in value:  # Null
+                processed_item[key] = "null"
+            elif 'B' in value:  # Binary
+                processed_item[key] = "[binary data]"
+            elif 'SS' in value:  # String Set
+                processed_item[key] = str(value['SS'])
+            elif 'NS' in value:  # Number Set
+                processed_item[key] = str(value['NS'])
+            elif 'BS' in value:  # Binary Set
+                processed_item[key] = "[binary set data]"
+            else:
+                # Para cualquier otro formato no reconocido
+                processed_item[key] = str(value)
         
+        processed_items.append(processed_item)
+    
+    # Determinar un schema común basado en todos los campos encontrados
+    all_fields = set()
+    for item in processed_items:
+        all_fields.update(item.keys())
+    
+    print(f"Campos encontrados en la tabla: {', '.join(sorted(all_fields))}")
+    
+    # Asegurarse de que cada item tenga todos los campos (con valores nulos si es necesario)
+    for item in processed_items:
+        for field in all_fields:
+            if field not in item:
+                item[field] = None
+    
+    # Crear un DataFrame con todos los campos como StringType
+    if processed_items:
+        schema_fields = [StructField(key, StringType(), True) for key in all_fields]
+        schema = StructType(schema_fields)
+        
+        print(f"Creando DataFrame con {len(schema_fields)} columnas...")
+        items_df = spark.createDataFrame(processed_items, schema=schema)
+        
+        # Convertir a DynamicFrame y retornar
+        return DynamicFrame.fromDF(items_df, glueContext, "dynamo_dyf")
+    else: 
+        raise Exception("No hay elementos en la tabla para procesar")
+
+    
         
 def evaluarCalidadDatos(dynamo_dyf):
     # Evaluar calidad de datos
@@ -469,109 +494,107 @@ def evaluarCalidadDatos(dynamo_dyf):
     )
 
 
+
+# 1. Leer datos de DynamoDB en Virginia (us-east-1)
+print(f"Leyendo datos desde DynamoDB en región {dynamo_region} (Virginia)...")
+
+dynamo_dyf = modulo_leer_datos_dynamo()
+
+evaluarCalidadDatos(dynamo_dyf)
+
+# Convertir a DataFrame
+dynamo_df = dynamo_dyf.toDF()
+total_dynamo_records = dynamo_df.count()
+print(f"Registros en DynamoDB: {total_dynamo_records}")
+
+# Si no hay registros en DynamoDB, terminar el proceso
+if total_dynamo_records == 0:
+    print("No hay registros en DynamoDB. Finalizando el proceso.")
+    job.commit()
+    sys.exit(0)
+
+# 2. Configurar explícitamente el cliente de S3 para usar Ohio (us-east-2)
+print(f"Configurando acceso a S3 en región {s3_region} (Ohio)")
+spark._jsc.hadoopConfiguration().set("fs.s3a.endpoint", f"s3.{s3_region}.amazonaws.com")
+spark._jsc.hadoopConfiguration().set("fs.s3a.region", s3_region)
+
+# Intentar leer los datos existentes en S3 en Ohio (us-east-2)
 try:
-    # 1. Leer datos de DynamoDB en Virginia (us-east-1)
-    print(f"Leyendo datos desde DynamoDB en región {dynamo_region} (Virginia)...")
-
-    dynamo_dyf = modulo_leer_datos_dynamo()
+    print(f"Leyendo datos existentes desde S3 en región {s3_region} (Ohio)...")
+    # Verificar que la configuración de región esté correcta
+    s3_client = get_s3_client(s3_region)
     
-    evaluarCalidadDatos(dynamo_dyf)
-
-    # Convertir a DataFrame
-    dynamo_df = dynamo_dyf.toDF()
-    total_dynamo_records = dynamo_df.count()
-    print(f"Registros en DynamoDB: {total_dynamo_records}")
+    # Leer recursivamente todos los archivos Parquet en todas las subcarpetas
+    existing_s3_df = spark.read.option("recursiveFileLookup", "true").parquet(s3_target_path)
+    existing_records_count = existing_s3_df.count()
+    print(f"Registros existentes en S3 (todas las subcarpetas): {existing_records_count}")
     
-    # Si no hay registros en DynamoDB, terminar el proceso
-    if total_dynamo_records == 0:
-        print("No hay registros en DynamoDB. Finalizando el proceso.")
-        job.commit()
-        sys.exit(0)
+    # 3. Identificar registros nuevos (no existen en S3)
+    print("Identificando registros nuevos...")
     
-    # 2. Configurar explícitamente el cliente de S3 para usar Ohio (us-east-2)
-    print(f"Configurando acceso a S3 en región {s3_region} (Ohio)")
-    spark._jsc.hadoopConfiguration().set("fs.s3a.endpoint", f"s3.{s3_region}.amazonaws.com")
-    spark._jsc.hadoopConfiguration().set("fs.s3a.region", s3_region)
+    # Para clave compuesta, usamos todas las columnas de clave primaria para el join
+    new_records_df = dynamo_df.join(
+        existing_s3_df,
+        on=composite_keys,
+        how="left_anti"
+    )
     
-    # Intentar leer los datos existentes en S3 en Ohio (us-east-2)
-    try:
-        print(f"Leyendo datos existentes desde S3 en región {s3_region} (Ohio)...")
-        # Verificar que la configuración de región esté correcta
-        s3_client = get_s3_client(s3_region)
+    new_records_count = new_records_df.count()
+    print(f"Registros nuevos a escribir: {new_records_count}")
+    
+    # 4. Solo escribir si hay registros nuevos
+    if new_records_count > 0:
+        print(f"Escribiendo {new_records_count} registros nuevos en S3...")
         
-        # Leer recursivamente todos los archivos Parquet en todas las subcarpetas
-        existing_s3_df = spark.read.option("recursiveFileLookup", "true").parquet(s3_target_path)
-        existing_records_count = existing_s3_df.count()
-        print(f"Registros existentes en S3 (todas las subcarpetas): {existing_records_count}")
-        
-        # 3. Identificar registros nuevos (no existen en S3)
-        print("Identificando registros nuevos...")
-        
-        # Para clave compuesta, usamos todas las columnas de clave primaria para el join
-        new_records_df = dynamo_df.join(
-            existing_s3_df,
-            on=composite_keys,
-            how="left_anti"
-        )
-        
-        new_records_count = new_records_df.count()
-        print(f"Registros nuevos a escribir: {new_records_count}")
-        
-        # 4. Solo escribir si hay registros nuevos
-        if new_records_count > 0:
-            print(f"Escribiendo {new_records_count} registros nuevos en S3...")
-            
-            # Preparar para escritura - añadir columnas de fecha y timestamp
-            timestamp_str = now.strftime("%Y-%m-%d %H:%M:%S")
-            new_records_prepared = new_records_df \
-                .withColumn("fecha_procesamiento", lit(current_date_str)) \
-                .withColumn("timestamp_procesamiento", lit(timestamp_str))
-            
-            # Convertir a DynamicFrame
-            new_records_dyf = DynamicFrame.fromDF(new_records_prepared, glueContext, "new_records")
-            
-            print(f"Configurando escritura de archivos individuales en S3 región {s3_region} (Ohio)")
-            # Llamada a la función especializada para claves primarias compuestas
-            write_consistent_parquet_files(
-                df=new_records_prepared,  # Usamos el DataFrame directamente
-                primary_key=composite_keys,  # Lista de claves compuestas
-                target_path=s3_new_records_path,
-                is_composite=True
-            )
-
-            print(f"Escritura completada: {new_records_count} registros escritos en {s3_new_records_path} (región: {s3_region})")
-        else:
-            print("No hay nuevos registros para escribir. No se crea ninguna carpeta nueva.")
-            
-    except Exception as s3_error:
-        print(f"Error al leer datos existentes de S3 o no existen datos previos: {str(s3_error)}")
-        print("Escribiendo todos los registros de DynamoDB por primera vez...")
-        
-        # En este caso, todos los registros de DynamoDB son nuevos
+        # Preparar para escritura - añadir columnas de fecha y timestamp
         timestamp_str = now.strftime("%Y-%m-%d %H:%M:%S")
-        all_records_prepared = dynamo_df \
+        new_records_prepared = new_records_df \
             .withColumn("fecha_procesamiento", lit(current_date_str)) \
             .withColumn("timestamp_procesamiento", lit(timestamp_str))
         
         # Convertir a DynamicFrame
-        all_records_dyf = DynamicFrame.fromDF(all_records_prepared, glueContext, "all_records")
+        new_records_dyf = DynamicFrame.fromDF(new_records_prepared, glueContext, "new_records")
         
-        # Segunda parte: cuando no hay datos existentes previos
-        print(f"Configurando escritura inicial de archivos individuales en S3 región {s3_region} (Ohio)")
+        print(f"Configurando escritura de archivos individuales en S3 región {s3_region} (Ohio)")
         # Llamada a la función especializada para claves primarias compuestas
         write_consistent_parquet_files(
-            df=dynamo_df,  # Usamos el DataFrame directamente
+            df=new_records_prepared,  # Usamos el DataFrame directamente
             primary_key=composite_keys,  # Lista de claves compuestas
             target_path=s3_new_records_path,
             is_composite=True
         )
 
+        print(f"Escritura completada: {new_records_count} registros escritos en {s3_new_records_path} (región: {s3_region})")
+    else:
+        print("No hay nuevos registros para escribir. No se crea ninguna carpeta nueva.")
         
-        print(f"Escritura inicial completada: {total_dynamo_records} registros escritos en {s3_new_records_path}")
+except Exception as s3_error:
+    print(f"Error al leer datos existentes de S3 o no existen datos previos: {str(s3_error)}")
+    print("Escribiendo todos los registros de DynamoDB por primera vez...")
+    
+    # En este caso, todos los registros de DynamoDB son nuevos
+    timestamp_str = now.strftime("%Y-%m-%d %H:%M:%S")
+    all_records_prepared = dynamo_df \
+        .withColumn("fecha_procesamiento", lit(current_date_str)) \
+        .withColumn("timestamp_procesamiento", lit(timestamp_str))
+    
+    # Convertir a DynamicFrame
+    all_records_dyf = DynamicFrame.fromDF(all_records_prepared, glueContext, "all_records")
+    
+    # Segunda parte: cuando no hay datos existentes previos
+    print(f"Configurando escritura inicial de archivos individuales en S3 región {s3_region} (Ohio)")
+    # Llamada a la función especializada para claves primarias compuestas
+    write_consistent_parquet_files(
+        df=dynamo_df,  # Usamos el DataFrame directamente
+        primary_key=composite_keys,  # Lista de claves compuestas
+        target_path=s3_new_records_path,
+        is_composite=True
+    )
+
+    
+    print(f"Escritura inicial completada: {total_dynamo_records} registros escritos en {s3_new_records_path}")
 
 
-except Exception as e:
-    print(f"Error durante la ejecución del job: {str(e)}")
-    raise e
+
 
 job.commit()
